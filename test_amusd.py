@@ -8,16 +8,16 @@ from datasets import load_from_disk
 if __name__ == "__main__":
     mp.set_start_method('spawn')
     
-    # verify = amusd.ModelConfig("meta-llama/Llama-3.1-8B-Instruct", "cuda:0", torch.float32)
-    # decoder = amusd.GreedyDecoder(verify)
+    verify = amusd.ModelConfig("meta-llama/Llama-3.1-8B-Instruct", "cuda:0", torch.float32)
+    decoder = amusd.GreedyDecoder(verify)
 
     # draft = amusd.ModelConfig("meta-llama/Llama-3.2-1B-Instruct", "cuda:0", torch.float32)
     # verify = amusd.ModelConfig("meta-llama/Llama-3.1-8B-Instruct", "cuda:0", torch.float32)
     # decoder = amusd.SyncSpeculativeDecoder(draft, verify)
 
-    draft = amusd.ModelConfig("meta-llama/Llama-3.2-1B-Instruct", "cuda:1", torch.float32)
-    verify = amusd.ModelConfig("meta-llama/Llama-3.1-8B-Instruct", "cuda:0", torch.float32)
-    decoder = amusd.AsyncMultiGPUSpeculativeDecoder(draft, verify)
+    # draft = amusd.ModelConfig("meta-llama/Llama-3.2-1B-Instruct", "cuda:1", torch.float32)
+    # verify = amusd.ModelConfig("meta-llama/Llama-3.1-8B-Instruct", "cuda:0", torch.float32)
+    # decoder = amusd.AsyncMultiGPUSpeculativeDecoder(draft, verify)
     
     tok = AutoTokenizer.from_pretrained(verify.model_path)
     
@@ -28,6 +28,7 @@ if __name__ == "__main__":
     print(output_ids)
     print(tok.decode(output_ids, skip_special_tokens=False))
     print(metrics)
+    print(sum(metrics["verify_times"]))
 
-    decoder.close()
+    # decoder.close()
 

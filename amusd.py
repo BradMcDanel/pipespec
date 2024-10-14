@@ -18,11 +18,7 @@ def find_divergence_point(tensor1, tensor2):
     diff_mask = common_part1 != common_part2
     
     if not diff_mask.any():
-        # If common parts are identical, check if sizes are different
-        if tensor1.size(0) != tensor2.size(0):
-            return min_length
-        else:
-            return None  # Tensors are identical
+        return None  # Tensors are identical
     
     # Find the first index where they differ
     divergence_index = diff_mask.nonzero(as_tuple=True)[0][0].item()
@@ -156,7 +152,7 @@ class ModelConfig:
 
 @dataclass
 class TokenBufferConfig:
-    initial_size: float = 8.0
+    initial_size: float = 5.0
     growth_exponent: float = 1.5
     decay_exponent: float = 2.0
     min_size: float = 1.0
@@ -252,13 +248,24 @@ class SyncSpeculativeDecoder:
             "token_buffer_sizes": []
         }
 
+        # Initial verify step
+        verify_start_time = time.time()
+        num_old_verified_tokens = verify_state["output_ids"].size(1)
+        verify_state = build_verify_inputs(draft_state["output_ids"], **verify_state)
+        verify_state = verify_step(self.verify_model, **verify_state)
+        num_new_verified_tokens = verify_state["output_ids"].size(1) - num_old_verified_tokens
+        verify_time = time.time() - verify_start_time
+
+        # Update draft state
+        draft_state = build_draft_inputs(verify_state["output_ids"], **draft_state)
+
         while verify_state["output_ids"].size(1) < self.max_new_tokens:
             # Draft step
-            draft_start_time = time.time()
             while draft_state["output_ids"].size(1) < verify_state["output_ids"].size(1) + round(token_buffer_size):
+                draft_start_time = time.time()
                 draft_state = step(self.draft_model, **draft_state)
-            draft_time = time.time() - draft_start_time
-            metrics["draft_times"].append(draft_time)
+                draft_time = time.time() - draft_start_time
+                metrics["draft_times"].append(draft_time)
 
             # Verify step
             verify_start_time = time.time()
@@ -279,6 +286,7 @@ class SyncSpeculativeDecoder:
             else:
                 token_buffer_size *= (num_new_verified_tokens / token_buffer_size) ** self.token_buffer_config.decay_exponent
             token_buffer_size = max(self.token_buffer_config.min_size, token_buffer_size)
+            token_buffer_size = 5
 
             # Check for EOS token
             if self.tokenizer.eos_token_id in verify_state["output_ids"][0, -num_new_verified_tokens:]:
@@ -307,8 +315,8 @@ class SyncSpeculativeDecoder:
 class AsyncMultiGPUSpeculativeDecoder:
     def __init__(self, draft_config: ModelConfig, verify_config: ModelConfig, 
                  token_buffer_config: TokenBufferConfig = TokenBufferConfig(),
-                 max_new_tokens: int = 4096, max_length: int = 128000, 
-                 max_log_entries: int = 100000):
+                 max_new_tokens: int = 4096, max_length: int = 4096, 
+                 max_log_entries: int = 10000):
         self.draft_config = draft_config
         self.verify_config = verify_config
         self.token_buffer_config = token_buffer_config
@@ -365,17 +373,27 @@ class AsyncMultiGPUSpeculativeDecoder:
         try:
             draft_model, _ = init_model(config.model_path, config.device, config.dtype)
             ready_event.set()
-            
+
             while True:
                 start_event.wait()
                 if close_event.is_set():
                     break
                 input_ids = shared_memory.input_tensor[1:shared_memory.input_tensor[0].item() + 1].unsqueeze(0).to(config.device)
+                # wait for initial verify token
+                while shared_memory.verify_tensor[0].item() == 0:
+                    time.sleep(0.001)
+
                 draft_state = step(draft_model, input_ids)
+
+                verify_output_ids = shared_memory.verify_tensor[1:shared_memory.verify_tensor[0].item()+1].unsqueeze(0)
+                last_verify_length = verify_output_ids.size(1)
+                draft_state = build_draft_inputs(verify_output_ids, **draft_state)
+
+                draft_state = step(draft_model, input_ids)
+
                 shared_memory.draft_tensor[1:1+draft_state["output_ids"].size(1)] = draft_state["output_ids"]
                 shared_memory.draft_tensor[0] = draft_state["output_ids"].size(1)
-                
-                last_verify_length = 0
+            
                 local_index = 0
                 while not completion_event.is_set():
                     start_time = time.time()
@@ -386,12 +404,14 @@ class AsyncMultiGPUSpeculativeDecoder:
                     output_ids = draft_state["output_ids"]
                     shared_memory.draft_tensor[1:1+output_ids.size(1)] = output_ids
                     shared_memory.draft_tensor[0] = output_ids.size(1)
-
+                    print(f"Draft Length: {output_ids.size(1)}")
+                
                     verify_length = shared_memory.verify_tensor[0].item()
                     if verify_length > last_verify_length:
                         verify_output_ids = shared_memory.verify_tensor[1:verify_length+1].unsqueeze(0)
                         draft_state = build_draft_inputs(verify_output_ids, **draft_state)
                         last_verify_length = verify_length
+                        print(f"Updated draft state with verify_output_ids of length {verify_length}")
 
                     end_time = time.time()
 
@@ -425,25 +445,45 @@ class AsyncMultiGPUSpeculativeDecoder:
                 verify_state = step(verify_model, input_ids)
                 
                 local_index = 0
+                must_rollback = False
                 while verify_state["output_ids"].size(1) < max_new_tokens:
-                    start_time = time.time()
-
                     # update shared memory
                     output_ids = verify_state["output_ids"]
+
+                    # How much does draft have now
+                    curr_draft_length = shared_memory.draft_tensor[0].item()
+                    
+                    # Tells draft
                     shared_memory.verify_tensor[1:1+output_ids.size(1)] = output_ids
                     shared_memory.verify_tensor[0] = output_ids.size(1)
+                    if must_rollback:
+                        while True:
+                            # If we see the new draft length decrease, we know rollback has occured
+                            new_draft_length = shared_memory.draft_tensor[0].item()
+                            if new_draft_length < curr_draft_length:
+                                break
 
-                    while shared_memory.draft_tensor[0].item() < shared_memory.verify_tensor[0].item() + round(token_buffer_size):
-                        pass
+                    print(f"Rollback: {must_rollback}")
+                    s = time.time()
+                    while shared_memory.draft_tensor[0].item() < shared_memory.verify_tensor[0].item() + round(token_buffer_size) + 1:
+                        time.sleep(0.001)
+                    print(f"Waited for {time.time() - s} seconds for {token_buffer_size + 1} tokens.") 
 
                     draft_length = shared_memory.draft_tensor[0].item()
                     draft_output_ids = shared_memory.draft_tensor[1:draft_length+1].unsqueeze(0)
                     num_old_verified_tokens = verify_state["output_ids"].size(1)
 
+                    start_time = time.time()
                     verify_state = build_verify_inputs(draft_output_ids, **verify_state)
+
+                    num_draft_tokens = verify_state["input_ids"].size(1)
+
                     verify_state = verify_step(verify_model, **verify_state)
+                    end_time = time.time()
                     
                     num_new_verified_tokens = verify_state["output_ids"].size(1) - num_old_verified_tokens
+                    print("Accepted tokens: ", num_new_verified_tokens)
+                    must_rollback = num_new_verified_tokens != num_draft_tokens
                     
                     # Dynamically adjust token_buffer_size
                     if num_new_verified_tokens > token_buffer_size:
@@ -454,8 +494,8 @@ class AsyncMultiGPUSpeculativeDecoder:
                         token_buffer_size *= (num_new_verified_tokens / token_buffer_size) ** token_buffer_config.decay_exponent
                     
                     token_buffer_size = max(token_buffer_config.min_size, token_buffer_size)
+                    token_buffer_size = 1
 
-                    end_time = time.time()
 
                     # Log metrics
                     idx = local_index % max_log_entries
@@ -471,6 +511,7 @@ class AsyncMultiGPUSpeculativeDecoder:
                         # trim output_ids
                         verify_state["output_ids"] = verify_state["output_ids"][:, :eos_index+1]
                         break
+
                 
                 shared_memory.verify_tensor[0] = verify_state["output_ids"].size(1)
                 shared_memory.verify_tensor[1:1+shared_memory.verify_tensor[0].item()] = verify_state["output_ids"]
