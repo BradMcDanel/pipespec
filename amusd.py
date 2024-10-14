@@ -151,13 +151,6 @@ class ModelConfig:
     dtype: torch.dtype
 
 @dataclass
-class TokenBufferConfig:
-    initial_size: float = 5.0
-    growth_exponent: float = 1.5
-    decay_exponent: float = 2.0
-    min_size: float = 1.0
-
-@dataclass
 class SharedMemory:
     input_tensor: torch.Tensor
     draft_tensor: torch.Tensor
@@ -165,7 +158,6 @@ class SharedMemory:
     draft_times: torch.Tensor
     verify_times: torch.Tensor
     accepted_tokens: torch.Tensor
-    token_buffer_sizes: torch.Tensor
     draft_index: torch.Tensor
     verify_index: torch.Tensor
 
@@ -203,7 +195,7 @@ class GreedyDecoder:
                 break
 
         total_time = time.time() - start_time
-        tokens_generated = state["output_ids"].size(1) - num_input_tokens
+        tokens_generated = state["output_ids"].size(1)
         time_per_token = total_time / tokens_generated
 
         metrics.update({
@@ -222,11 +214,11 @@ class GreedyDecoder:
 
 class SyncSpeculativeDecoder:
     def __init__(self, draft_config: ModelConfig, verify_config: ModelConfig, 
-                 token_buffer_config: TokenBufferConfig = TokenBufferConfig(),
+                 draft_lookahead: int = 5,
                  max_new_tokens: int = 4096):
         self.draft_config = draft_config
         self.verify_config = verify_config
-        self.token_buffer_config = token_buffer_config
+        self.draft_lookahead = draft_lookahead
         self.max_new_tokens = max_new_tokens
 
         self._init_models()
@@ -236,7 +228,6 @@ class SyncSpeculativeDecoder:
         self.verify_model, self.tokenizer = init_model(self.verify_config.model_path, self.verify_config.device, self.verify_config.dtype)
 
     def generate(self, input_ids, return_metrics=False):
-        token_buffer_size = self.token_buffer_config.initial_size
         draft_state = step(self.draft_model, input_ids)
         verify_state = step(self.verify_model, input_ids)
 
@@ -245,23 +236,11 @@ class SyncSpeculativeDecoder:
             "draft_times": [],
             "verify_times": [],
             "accepted_tokens": [],
-            "token_buffer_sizes": []
         }
-
-        # Initial verify step
-        verify_start_time = time.time()
-        num_old_verified_tokens = verify_state["output_ids"].size(1)
-        verify_state = build_verify_inputs(draft_state["output_ids"], **verify_state)
-        verify_state = verify_step(self.verify_model, **verify_state)
-        num_new_verified_tokens = verify_state["output_ids"].size(1) - num_old_verified_tokens
-        verify_time = time.time() - verify_start_time
-
-        # Update draft state
-        draft_state = build_draft_inputs(verify_state["output_ids"], **draft_state)
 
         while verify_state["output_ids"].size(1) < self.max_new_tokens:
             # Draft step
-            while draft_state["output_ids"].size(1) < verify_state["output_ids"].size(1) + round(token_buffer_size):
+            while draft_state["output_ids"].size(1) < verify_state["output_ids"].size(1) + self.draft_lookahead:
                 draft_start_time = time.time()
                 draft_state = step(self.draft_model, **draft_state)
                 draft_time = time.time() - draft_start_time
@@ -278,15 +257,6 @@ class SyncSpeculativeDecoder:
             # Update metrics
             metrics["verify_times"].append(verify_time)
             metrics["accepted_tokens"].append(num_new_verified_tokens)
-            metrics["token_buffer_sizes"].append(token_buffer_size)
-
-            # Dynamically adjust token_buffer_size
-            if num_new_verified_tokens > token_buffer_size:
-                token_buffer_size *= (num_new_verified_tokens / token_buffer_size) ** self.token_buffer_config.growth_exponent
-            else:
-                token_buffer_size *= (num_new_verified_tokens / token_buffer_size) ** self.token_buffer_config.decay_exponent
-            token_buffer_size = max(self.token_buffer_config.min_size, token_buffer_size)
-            token_buffer_size = 5
 
             # Check for EOS token
             if self.tokenizer.eos_token_id in verify_state["output_ids"][0, -num_new_verified_tokens:]:
@@ -314,12 +284,10 @@ class SyncSpeculativeDecoder:
 
 class AsyncMultiGPUSpeculativeDecoder:
     def __init__(self, draft_config: ModelConfig, verify_config: ModelConfig, 
-                 token_buffer_config: TokenBufferConfig = TokenBufferConfig(),
                  max_new_tokens: int = 4096, max_length: int = 4096, 
                  max_log_entries: int = 10000):
         self.draft_config = draft_config
         self.verify_config = verify_config
-        self.token_buffer_config = token_buffer_config
         self.max_new_tokens = max_new_tokens
         self.max_length = max_length
         self.max_log_entries = max_log_entries
@@ -335,7 +303,6 @@ class AsyncMultiGPUSpeculativeDecoder:
             draft_times=torch.zeros(self.max_log_entries, dtype=torch.float32).share_memory_(),
             verify_times=torch.zeros(self.max_log_entries, dtype=torch.float32).share_memory_(),
             accepted_tokens=torch.zeros(self.max_log_entries, dtype=torch.int32).share_memory_(),
-            token_buffer_sizes=torch.zeros(self.max_log_entries, dtype=torch.float32).share_memory_(),
             draft_index=torch.tensor([0], dtype=torch.int32).share_memory_(),
             verify_index=torch.tensor([0], dtype=torch.int32).share_memory_()
         )
@@ -353,7 +320,7 @@ class AsyncMultiGPUSpeculativeDecoder:
 
     def _start_processes(self):
         self.verify_process = self.pool.apply_async(self._verify_process, (
-            self.verify_config, self.shared_memory, self.token_buffer_config,
+            self.verify_config, self.shared_memory,
             self.verify_ready_event, self.start_event, self.completion_event, 
             self.close_event, self.max_log_entries, self.max_new_tokens
         ))
@@ -404,14 +371,12 @@ class AsyncMultiGPUSpeculativeDecoder:
                     output_ids = draft_state["output_ids"]
                     shared_memory.draft_tensor[1:1+output_ids.size(1)] = output_ids
                     shared_memory.draft_tensor[0] = output_ids.size(1)
-                    print(f"Draft Length: {output_ids.size(1)}")
                 
                     verify_length = shared_memory.verify_tensor[0].item()
                     if verify_length > last_verify_length:
                         verify_output_ids = shared_memory.verify_tensor[1:verify_length+1].unsqueeze(0)
                         draft_state = build_draft_inputs(verify_output_ids, **draft_state)
                         last_verify_length = verify_length
-                        print(f"Updated draft state with verify_output_ids of length {verify_length}")
 
                     end_time = time.time()
 
@@ -427,7 +392,6 @@ class AsyncMultiGPUSpeculativeDecoder:
 
     @staticmethod
     def _verify_process(config: ModelConfig, shared_memory: SharedMemory, 
-                        token_buffer_config: TokenBufferConfig,
                         ready_event, start_event, completion_event, close_event, 
                         max_log_entries, max_new_tokens):
         try:
@@ -439,7 +403,6 @@ class AsyncMultiGPUSpeculativeDecoder:
                 if close_event.is_set():
                     break
 
-                token_buffer_size = token_buffer_config.initial_size
 
                 input_ids = shared_memory.input_tensor[1:shared_memory.input_tensor[0].item() + 1].unsqueeze(0).to(config.device)
                 verify_state = step(verify_model, input_ids)
@@ -463,11 +426,8 @@ class AsyncMultiGPUSpeculativeDecoder:
                             if new_draft_length < curr_draft_length:
                                 break
 
-                    print(f"Rollback: {must_rollback}")
-                    s = time.time()
-                    while shared_memory.draft_tensor[0].item() < shared_memory.verify_tensor[0].item() + round(token_buffer_size) + 1:
+                    while shared_memory.draft_tensor[0].item() < shared_memory.verify_tensor[0].item() + 1:
                         time.sleep(0.001)
-                    print(f"Waited for {time.time() - s} seconds for {token_buffer_size + 1} tokens.") 
 
                     draft_length = shared_memory.draft_tensor[0].item()
                     draft_output_ids = shared_memory.draft_tensor[1:draft_length+1].unsqueeze(0)
@@ -482,26 +442,13 @@ class AsyncMultiGPUSpeculativeDecoder:
                     end_time = time.time()
                     
                     num_new_verified_tokens = verify_state["output_ids"].size(1) - num_old_verified_tokens
-                    print("Accepted tokens: ", num_new_verified_tokens)
                     must_rollback = num_new_verified_tokens != num_draft_tokens
                     
-                    # Dynamically adjust token_buffer_size
-                    if num_new_verified_tokens > token_buffer_size:
-                        # Growth
-                        token_buffer_size *= (num_new_verified_tokens / token_buffer_size) ** token_buffer_config.growth_exponent
-                    else:
-                        # Decay
-                        token_buffer_size *= (num_new_verified_tokens / token_buffer_size) ** token_buffer_config.decay_exponent
-                    
-                    token_buffer_size = max(token_buffer_config.min_size, token_buffer_size)
-                    token_buffer_size = 1
-
 
                     # Log metrics
                     idx = local_index % max_log_entries
                     shared_memory.verify_times[idx] = end_time - start_time
                     shared_memory.accepted_tokens[idx] = num_new_verified_tokens
-                    shared_memory.token_buffer_sizes[idx] = token_buffer_size
                     local_index += 1
                     
                     # Check only newly generated tokens for eos_token_id
@@ -550,13 +497,11 @@ class AsyncMultiGPUSpeculativeDecoder:
         draft_times = self.shared_memory.draft_times[:num_draft_logs].tolist()
         verify_times = self.shared_memory.verify_times[:num_verify_logs].tolist()
         accepted_tokens = self.shared_memory.accepted_tokens[:num_verify_logs].tolist()
-        token_buffer_sizes = self.shared_memory.token_buffer_sizes[:num_verify_logs].tolist()
 
         metrics = {
             "draft_times": draft_times,
             "verify_times": verify_times,
             "accepted_tokens": accepted_tokens,
-            "token_buffer_sizes": token_buffer_sizes,
             "total_time": total_time,
             "tokens_generated": tokens_generated,
             "time_per_token": time_per_token
