@@ -1,9 +1,12 @@
 import argparse
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 from datasets import load_from_disk
-import amusd
 import torch.multiprocessing as mp
+mp.set_start_method('spawn', force=True)
+
+import amusd
+from gpu_monitor import GPUMonitor
 
 MAX_NEW_TOKENS = 4096
 
@@ -16,6 +19,8 @@ if __name__ == "__main__":
     parser.add_argument("--sample-index", type=int, default=0, help="Index of the sample to use from the dataset")
     args = parser.parse_args()
 
+    monitor = GPUMonitor()
+
     if args.strategy == 'greedy':
         verify = amusd.ModelConfig(args.verify_model_path, "cuda:0", torch.float32)
         decoder = amusd.GreedyDecoder(verify, max_new_tokens=MAX_NEW_TOKENS)
@@ -24,7 +29,6 @@ if __name__ == "__main__":
         verify = amusd.ModelConfig(args.verify_model_path, "cuda:0", torch.float32)
         decoder = amusd.SyncSpeculativeDecoder(draft, verify, max_new_tokens=MAX_NEW_TOKENS)
     elif args.strategy == 'amusd':
-        mp.set_start_method('spawn')
         draft = amusd.ModelConfig(args.draft_model_path, "cuda:1", torch.float32)
         verify = amusd.ModelConfig(args.verify_model_path, "cuda:0", torch.float32)
         decoder = amusd.AsyncMultiGPUSpeculativeDecoder(draft, verify, max_new_tokens=MAX_NEW_TOKENS)
@@ -32,27 +36,24 @@ if __name__ == "__main__":
     tok = AutoTokenizer.from_pretrained(verify.model_path)
 
     dataset = load_from_disk(args.dataset)
-
-    for i in range(args.sample_index, args.sample_index + 1000):
-        if len(dataset[i]['conversation']) > 2:
-            args.sample_index = i
-            break
-
     conversation = dataset[args.sample_index]['conversation']
 
-    # Process only the last turn
-    # print number of turns
-    print(f"Number of turns: {len(conversation)}")
     last_assistant_turn = next((turn for turn in reversed(conversation) if turn['role'] == 'assistant'), None)
     if last_assistant_turn is None:
-        raise ValueError("No assistant turn found in the conversation")
+        last_turn_index = len(conversation)
+    else:
+        last_turn_index = conversation.index(last_assistant_turn)
 
-    last_turn_index = conversation.index(last_assistant_turn)
-    input_ids = tok.apply_chat_template(conversation[:last_turn_index], return_tensors="pt")
+    conversation = conversation[:last_turn_index]
 
+    input_ids = tok.apply_chat_template(conversation, return_tensors="pt")
+
+    monitor.start()
     output_ids, metrics = decoder.generate(input_ids, return_metrics=True)
-    print(output_ids)
-    print(tok.decode(output_ids, skip_special_tokens=False))
+    monitor.stop()
+    metrics["gpustats"] = monitor.get_results()
+    
+    print(tok.decode(output_ids, skip_special_tokens=True))
     print(metrics)
 
     if args.strategy == 'amusd':

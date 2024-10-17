@@ -175,10 +175,10 @@ class GreedyDecoder:
         )
 
     def generate(self, input_ids, return_metrics=False):
-        state = step(self.model, input_ids)
-        num_input_tokens = input_ids.size(1)
-        
         start_time = time.time()
+
+        state = step(self.model, input_ids)
+
         metrics = {
             "token_times": []
         }
@@ -205,7 +205,7 @@ class GreedyDecoder:
         })
 
         # Use output_ids for the final output
-        generated_ids = state["output_ids"][0, num_input_tokens:]
+        generated_ids = state["output_ids"][0]
 
         if return_metrics:
             return generated_ids, metrics
@@ -284,7 +284,7 @@ class SyncSpeculativeDecoder:
 
 class AsyncMultiGPUSpeculativeDecoder:
     def __init__(self, draft_config: ModelConfig, verify_config: ModelConfig, 
-                 max_new_tokens: int = 4096, max_length: int = 4096, 
+                 max_new_tokens: int = 4096, max_length: int = 8096, 
                  max_log_entries: int = 10000):
         self.draft_config = draft_config
         self.verify_config = verify_config
@@ -310,6 +310,7 @@ class AsyncMultiGPUSpeculativeDecoder:
     def _init_multiprocessing(self):
         self.manager = mp.Manager()
         self.draft_ready_event = self.manager.Event()
+        self.draft_reset_event = self.manager.Event()
         self.verify_ready_event = self.manager.Event()
         self.start_event = self.manager.Event()
         self.completion_event = self.manager.Event()
@@ -326,7 +327,7 @@ class AsyncMultiGPUSpeculativeDecoder:
         ))
         self.draft_process = self.pool.apply_async(self._draft_process, (
             self.draft_config, self.shared_memory,
-            self.draft_ready_event, self.start_event, self.completion_event, 
+            self.draft_ready_event, self.draft_reset_event, self.start_event, self.completion_event, 
             self.close_event, self.max_log_entries
         ))
         
@@ -335,7 +336,7 @@ class AsyncMultiGPUSpeculativeDecoder:
 
     @staticmethod
     def _draft_process(config: ModelConfig, shared_memory: SharedMemory, 
-                       ready_event, start_event, completion_event, close_event, 
+                       ready_event, reset_event, start_event, completion_event, close_event, 
                        max_log_entries):
         try:
             draft_model, _ = init_model(config.model_path, config.device, config.dtype)
@@ -348,7 +349,7 @@ class AsyncMultiGPUSpeculativeDecoder:
                 input_ids = shared_memory.input_tensor[1:shared_memory.input_tensor[0].item() + 1].unsqueeze(0).to(config.device)
                 # wait for initial verify token
                 while shared_memory.verify_tensor[0].item() == 0:
-                    time.sleep(0.001)
+                    time.sleep(0.0001)
 
                 draft_state = step(draft_model, input_ids)
 
@@ -374,9 +375,15 @@ class AsyncMultiGPUSpeculativeDecoder:
                 
                     verify_length = shared_memory.verify_tensor[0].item()
                     if verify_length > last_verify_length:
+                        last_draft_length = draft_state["output_ids"].size(1)
                         verify_output_ids = shared_memory.verify_tensor[1:verify_length+1].unsqueeze(0)
                         draft_state = build_draft_inputs(verify_output_ids, **draft_state)
+                        draft_length = draft_state["output_ids"].size(1)
                         last_verify_length = verify_length
+                        
+                        if draft_length < last_draft_length:
+                            # Rollback has occured
+                            shared_memory.draft_tensor[-1] += 1
 
                     end_time = time.time()
 
@@ -387,6 +394,7 @@ class AsyncMultiGPUSpeculativeDecoder:
                     shared_memory.draft_index[0] = local_index
                 
                 shared_memory.draft_index[0] = local_index
+                reset_event.set()
         except Exception as e:
             print(f"Exception in draft process: {e}")
 
@@ -413,21 +421,20 @@ class AsyncMultiGPUSpeculativeDecoder:
                     # update shared memory
                     output_ids = verify_state["output_ids"]
 
-                    # How much does draft have now
-                    curr_draft_length = shared_memory.draft_tensor[0].item()
+                    # Get current rollback value
+                    rollback_value = shared_memory.draft_tensor[-1].item()
                     
                     # Tells draft
                     shared_memory.verify_tensor[1:1+output_ids.size(1)] = output_ids
                     shared_memory.verify_tensor[0] = output_ids.size(1)
+
+
                     if must_rollback:
-                        while True:
-                            # If we see the new draft length decrease, we know rollback has occured
-                            new_draft_length = shared_memory.draft_tensor[0].item()
-                            if new_draft_length < curr_draft_length:
-                                break
+                        while rollback_value == shared_memory.draft_tensor[-1].item():
+                            time.sleep(0.0001)
 
                     while shared_memory.draft_tensor[0].item() < shared_memory.verify_tensor[0].item() + 1:
-                        time.sleep(0.001)
+                        time.sleep(0.0001)
 
                     draft_length = shared_memory.draft_tensor[0].item()
                     draft_output_ids = shared_memory.draft_tensor[1:draft_length+1].unsqueeze(0)
@@ -486,7 +493,11 @@ class AsyncMultiGPUSpeculativeDecoder:
         start_time = time.time()
         self.completion_event.wait()
         total_time = time.time() - start_time
-        
+
+        # wait for draft reset event
+        self.draft_reset_event.wait()
+        self.draft_reset_event.clear()
+
         final_output_ids = self.shared_memory.verify_tensor[1:self.shared_memory.verify_tensor[0].item()+1].clone()
         tokens_generated = len(final_output_ids)
         time_per_token = total_time / tokens_generated
