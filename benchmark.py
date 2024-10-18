@@ -1,18 +1,17 @@
 import argparse
 import json
-
 import torch
 from transformers import AutoTokenizer
 from datasets import load_from_disk
 from tqdm import tqdm
 import torch.multiprocessing as mp
 mp.set_start_method('spawn', force=True)
-
 import amusd
 from gpu_monitor import GPUMonitor
-
+import gc
 
 MAX_NEW_TOKENS = 4096
+STRATEGIES = ['greedy', 'sd', 'amusd']
 
 def run_benchmark(args, strategy, monitor):
     if strategy == 'greedy':
@@ -49,7 +48,6 @@ def run_benchmark(args, strategy, monitor):
         monitor.stop()
         metrics["gpustats"] = monitor.get_results()
         monitor.clear()
-
         results.append({
             "sample_index": i,
             "strategy": strategy,
@@ -58,7 +56,11 @@ def run_benchmark(args, strategy, monitor):
     
     if strategy == 'amusd':
         decoder.close()
-    
+
+    del decoder
+    torch.cuda.empty_cache()
+    gc.collect()
+
     return results
 
 def main():
@@ -68,13 +70,15 @@ def main():
     parser.add_argument("--dataset", type=str, required=True, help="Name of the dataset to use")
     parser.add_argument("--num-samples", type=int, help="Number of samples to process (optional, processes all samples if not specified)")
     parser.add_argument("--output-file", type=str, default="benchmark_results.json", help="Output JSON file name")
+    parser.add_argument("--strategies", nargs='+', choices=STRATEGIES, default=STRATEGIES,
+                        help="Strategies to benchmark (default: all strategies)")
     args = parser.parse_args()
-
+    
     monitor = GPUMonitor()
     
     all_results = []
     
-    for strategy in ['greedy', 'sd', 'amusd']:
+    for strategy in args.strategies:
         results = run_benchmark(args, strategy, monitor)
         all_results.extend(results)
     

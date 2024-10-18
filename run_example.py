@@ -22,15 +22,15 @@ if __name__ == "__main__":
     monitor = GPUMonitor()
 
     if args.strategy == 'greedy':
-        verify = amusd.ModelConfig(args.verify_model_path, "cuda:0", torch.float32)
+        verify = amusd.ModelConfig(args.verify_model_path, "cuda:0", torch.float16)
         decoder = amusd.GreedyDecoder(verify, max_new_tokens=MAX_NEW_TOKENS)
     elif args.strategy == 'sd':
-        draft = amusd.ModelConfig(args.draft_model_path, "cuda:0", torch.float32)
-        verify = amusd.ModelConfig(args.verify_model_path, "cuda:0", torch.float32)
+        draft = amusd.ModelConfig(args.draft_model_path, "cuda:0", torch.float16)
+        verify = amusd.ModelConfig(args.verify_model_path, "cuda:0", torch.float16)
         decoder = amusd.SyncSpeculativeDecoder(draft, verify, max_new_tokens=MAX_NEW_TOKENS)
     elif args.strategy == 'amusd':
-        draft = amusd.ModelConfig(args.draft_model_path, "cuda:1", torch.float32)
-        verify = amusd.ModelConfig(args.verify_model_path, "cuda:0", torch.float32)
+        draft = amusd.ModelConfig(args.draft_model_path, "cuda:1", torch.float16)
+        verify = amusd.ModelConfig(args.verify_model_path, "cuda:0", torch.float16)
         decoder = amusd.AsyncMultiGPUSpeculativeDecoder(draft, verify, max_new_tokens=MAX_NEW_TOKENS)
 
     tok = AutoTokenizer.from_pretrained(verify.model_path)
