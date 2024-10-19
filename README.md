@@ -1,17 +1,10 @@
 # AMUSD: Asynchronous Multi-Device Speculative Decoding for LLM Acceleration
 
-This repository contains the implementation and evaluation code for AMUSD (Asynchronous Multi-device Speculative Decoding), a novel system for accelerating large language model inference. AMUSD decouples the draft and verify phases of speculative decoding into continuous, asynchronous operations across multiple GPUs, achieving significant performance improvements over traditional methods.
+This repository contains the implementation and evaluation code for AMUSD (Asynchronous Multi-device Speculative Decoding), a novel system for accelerating large language model inference. AMUSD decouples the draft and verify phases of speculative decoding into continuous, asynchronous operations across multiple devices (e.g., GPUs), achieving significant performance improvements over alternating draft and verify phases in conventional speculative decoding.
 
 ![AMUSD Overview](figures/overview.png)
 
-## Key Features
-
-- Asynchronous execution of draft and verify models on separate GPUs
-- Continuous token generation and verification
-- Dynamic rollback mechanism for handling mismatches
-- Improved GPU utilization and reduced idle time
-
-# Benchmark Results
+## Benchmark Results
 
 | Benchmark   | Method        | Mean Token Time (↓) | Speedup (↑) |
 |-------------|---------------|---------------------|-------------|
@@ -43,13 +36,16 @@ To benchmark AMUSD against other decoding methods:
 python benchmark.py --draft-model-path <path_to_draft_model> --verify-model-path <path_to_verify_model> --dataset <dataset_name> --num-samples <number_of_samples> --output-file <output_file_name>
 ```
 
-## Results
+## Reproducing Results
 
 Benchmark results are stored in the `results/` directory. You can analyze these results using the `print_benchmark_stats.py` script:
 
 ```bash
 python print_benchmark_stats.py results/<benchmark_result_file>.json
 ```
+
+Check the `viz/` directory for scripts to generate visualizations of the benchmark results.
+
 
 ## Citation
 
