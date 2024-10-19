@@ -11,7 +11,19 @@ This repository contains the implementation and evaluation code for AMUSD (Async
 - Dynamic rollback mechanism for handling mismatches
 - Improved GPU utilization and reduced idle time
 
-## Performance
+# Benchmark Results
+
+| Benchmark   | Method        | Mean Token Time (↓) | Speedup (↑) |
+|-------------|---------------|---------------------|-------------|
+| HumanEval   | Autoregressive| 22.15 ms/token      | 1.00×       |
+|             | Speculative   | 17.88 ms/token      | 1.24×       |
+|             | AMUSD (ours)  | 14.08 ms/token      | 1.57×       |
+| MT-Bench    | Autoregressive| 21.89 ms/token      | 1.00×       |
+|             | Speculative   | 20.64 ms/token      | 1.06×       |
+|             | AMUSD (ours)  | 16.75 ms/token      | 1.31×       |
+| RefactorChat| Autoregressive| 27.42 ms/token      | 1.00×       |
+|             | Speculative   | 19.18 ms/token      | 1.43×       |
+|             | AMUSD (ours)  | 13.96 ms/token      | 1.96×       |
 
 AMUSD consistently outperforms both autoregressive and conventional speculative decoding across various benchmarks, achieving up to 1.96× speedup without compromising output quality.
 
