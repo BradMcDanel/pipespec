@@ -1,0 +1,54 @@
+# AMUSD: Asynchronous Multi-Device Speculative Decoding for LLM Acceleration
+
+This repository contains the implementation and evaluation code for AMUSD (Asynchronous Multi-device Speculative Decoding), a novel system for accelerating large language model inference. AMUSD decouples the draft and verify phases of speculative decoding into continuous, asynchronous operations across multiple GPUs, achieving significant performance improvements over traditional methods.
+
+![AMUSD Overview](figures/overview.png)
+
+## Key Features
+
+- Asynchronous execution of draft and verify models on separate GPUs
+- Continuous token generation and verification
+- Dynamic rollback mechanism for handling mismatches
+- Improved GPU utilization and reduced idle time
+
+## Performance
+
+AMUSD consistently outperforms both autoregressive and conventional speculative decoding across various benchmarks, achieving up to 1.96× speedup without compromising output quality.
+
+![Token Generation Comparison](figures/token-generation-comparison.png)
+
+## Usage
+
+To run a simple example of AMUSD:
+
+```bash
+python run_example.py
+```
+
+To benchmark AMUSD against other decoding methods:
+
+```bash
+python benchmark.py --draft-model-path <path_to_draft_model> --verify-model-path <path_to_verify_model> --dataset <dataset_name> --num-samples <number_of_samples> --output-file <output_file_name>
+```
+
+## Results
+
+Benchmark results are stored in the `results/` directory. You can analyze these results using the `print_benchmark_stats.py` script:
+
+```bash
+python print_benchmark_stats.py results/<benchmark_result_file>.json
+```
+
+## Citation
+
+If you use AMUSD in your research, please cite our paper:
+
+[Citation information to be added]
+
+## License
+
+[MIT License](LICENSE)
+
+## Contact
+
+For any questions or issues, please open an issue on this repository or contact Bradley McDanel at bmcdanel@fandm.edu.
