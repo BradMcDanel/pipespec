@@ -4,7 +4,7 @@ import numpy as np
 import os
 
 # Load the JSON data
-with open('results/python-refactoring_sample.json', 'r') as f:
+with open('results/refactorchat_sample.json', 'r') as f:
     data = json.load(f)
 
 # Extract data for each approach
@@ -95,7 +95,7 @@ plt.rcParams.update({
     'axes.labelsize': 12,
     'axes.labelweight': 'bold',
     'font.size': 12,
-    'figure.figsize': [8, 3],
+    'figure.figsize': [8, 4],
     'lines.linewidth': 2,
     'axes.prop_cycle': plt.cycler('color', ['#4682B4', '#32CD32', '#FF8C00']),  # Steel blue, lime green, dark orange
     'xtick.direction': 'out',
@@ -108,7 +108,7 @@ plt.rcParams.update({
 })
 
 # Plot cumulative tokens over time using step plots
-fig, ax = plt.subplots(figsize=(8, 3))
+fig, ax = plt.subplots(figsize=(8, 4))
 
 # Main lines
 ax.step(greedy_times, greedy_tokens, where='post', linewidth=2, color='#4682B4')
@@ -124,9 +124,9 @@ strategies = [
 
 # Adjust y-offsets and positions for labels
 strategy_text_offsets = {
-    "Autoregressive": (12.5, 580, 15),
-    "Speculative Decoding": (7, 420, 18.5),
-    "AMUSD (ours)": (3, 205, 27.5),
+    "Autoregressive": (12.5, 580, 24),
+    "Speculative Decoding": (7, 420, 28.5),
+    "AMUSD (ours)": (3, 205, 37.5),
 }
 
 for strat in strategies:
@@ -168,3 +168,13 @@ os.makedirs('figures', exist_ok=True)
 plt.savefig('figures/token-generation-comparison.pdf', dpi=400, bbox_inches='tight')
 plt.show()
 
+
+def get_average_accepted(strategy_data):
+    accepted_tokens = strategy_data['metrics'].get('accepted_tokens', [])
+    if accepted_tokens:
+        return sum(accepted_tokens) / len(accepted_tokens)
+    return 0
+
+print("\nAverage accepted tokens per batch:")
+print(f"Speculative Decoding: {get_average_accepted(sd_data):.2f}")
+print(f"AMUSD: {get_average_accepted(amusd_data):.2f}")

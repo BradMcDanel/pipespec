@@ -2,7 +2,7 @@ import argparse
 import json
 import torch
 from transformers import AutoTokenizer
-from datasets import load_from_disk
+from datasets import load_from_disk, load_dataset
 from tqdm import tqdm
 import torch.multiprocessing as mp
 mp.set_start_method('spawn', force=True)
@@ -27,7 +27,11 @@ def run_benchmark(args, strategy, monitor):
         decoder = amusd.AsyncMultiGPUSpeculativeDecoder(draft, verify, max_new_tokens=MAX_NEW_TOKENS)
     
     tok = AutoTokenizer.from_pretrained(args.verify_model_path)
-    dataset = load_from_disk(args.dataset)
+    try:
+        dataset = load_dataset(args.dataset)
+        dataset = dataset["train"]
+    except:
+        dataset = load_from_disk(args.dataset)
     
     results = []
     

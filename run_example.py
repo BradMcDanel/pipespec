@@ -1,7 +1,7 @@
 import argparse
 import torch
 from transformers import AutoTokenizer
-from datasets import load_from_disk
+from datasets import load_from_disk, load_dataset
 import torch.multiprocessing as mp
 mp.set_start_method('spawn', force=True)
 
@@ -35,7 +35,12 @@ if __name__ == "__main__":
 
     tok = AutoTokenizer.from_pretrained(verify.model_path)
 
-    dataset = load_from_disk(args.dataset)
+    try:
+        dataset = load_dataset(args.dataset)
+        dataset = dataset["train"]
+    except:
+        dataset = load_from_disk(args.dataset)
+
     conversation = dataset[args.sample_index]['conversation']
 
     last_assistant_turn = next((turn for turn in reversed(conversation) if turn['role'] == 'assistant'), None)

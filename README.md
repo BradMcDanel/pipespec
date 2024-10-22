@@ -27,13 +27,13 @@ AMUSD consistently outperforms both autoregressive and conventional speculative 
 To run a simple example of AMUSD:
 
 ```bash
-python run_example.py
+python run_example.py --dataset BradMcDanel/refactorchat --sample-index 0 --strategy amusd
 ```
 
 To benchmark AMUSD against other decoding methods:
 
 ```bash
-python benchmark.py --draft-model-path <path_to_draft_model> --verify-model-path <path_to_verify_model> --dataset <dataset_name> --num-samples <number_of_samples> --output-file <output_file_name>
+python benchmark.py --draft-model-path meta-llama/Llama-3.2-1B-Instruct --verify-model-path meta-llama/Llama-3.1-8B-Instruct --dataset BradMcDanel/RefactorChat --num-samples 2 --output-file results/refactorchat.json --strategies greedy sd amusd
 ```
 
 ## Reproducing Results
