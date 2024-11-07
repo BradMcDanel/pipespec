@@ -1,39 +1,116 @@
 import argparse
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, BitsAndBytesConfig
 from datasets import load_from_disk, load_dataset
 import torch.multiprocessing as mp
+from dataclasses import dataclass
+from typing import List, Optional
+import json
 mp.set_start_method('spawn', force=True)
-
-import amusd
+import decoding
 from gpu_monitor import GPUMonitor
 
 MAX_NEW_TOKENS = 4096
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--draft-model-path", type=str, default="meta-llama/Llama-3.2-1B-Instruct", help="Path to the draft model")
-    parser.add_argument("--verify-model-path", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="Path to the verify model (for sd and amusd)")
-    parser.add_argument("--strategy", type=str, default="edit-based", choices=["greedy", "sd", "amusd"], help="Decoding strategy")
-    parser.add_argument("--dataset", type=str, default="lmsys-chat-100k-clustered-labeled", help="Name of the dataset to use")
-    parser.add_argument("--sample-index", type=int, default=0, help="Index of the sample to use from the dataset")
+    parser.add_argument("--strategy", type=str, default="three-model", 
+                      choices=["greedy", "sd", "amusd", "three-model", "amusd-three"],
+                      help="Decoding strategy (three-model=sync, amusd-three=async)")
+    parser.add_argument("--dataset", type=str, required=True,
+                      help="Path or name of the dataset to use")
+    parser.add_argument("--sample-index", type=int, default=0,
+                      help="Index of the sample to use from the dataset")
+    parser.add_argument("--lookahead", type=int, default=4,
+                      help="Number of tokens to look ahead in speculative decoding")
+    
+    # Models configuration
+    parser.add_argument("--models", type=str, required=True, help="""
+        JSON array of model configurations. Example:
+        [
+            {
+                "path": "meta-llama/Llama-3.2-1B-Instruct",
+                "devices": ["cuda:2"],
+                "dtype": "float16"
+            },
+            {
+                "path": "meta-llama/Llama-3.1-8B-Instruct",
+                "devices": ["cuda:1"],
+                "dtype": "bfloat16"
+            },
+            {
+                "path": "meta-llama/Meta-Llama-3.1-70B-Instruct",
+                "devices": ["cuda:0", "cuda:1"],
+                "dtype": "bfloat16",
+                "quantize": "4bit"
+            }
+        ]
+        """)
+
     args = parser.parse_args()
+
+    # Parse model configurations
+    model_configs = []
+    models_json = json.loads(args.models)
+    for cfg in models_json:
+        dtype = torch.bfloat16 if cfg.get('dtype', 'float16') == 'bfloat16' else torch.float16
+        quantization_config = None
+        if cfg.get('quantize') == '4bit':
+            quantization_config = decoding.create_4bit_config(compute_dtype=dtype)
+        elif cfg.get('quantize') == '8bit':
+            quantization_config = decoding.create_8bit_config()
+
+        model_config = decoding.ModelConfig(
+            model_path=cfg['path'],
+            devices=cfg['devices'],
+            dtype=dtype,
+            quantization_config=quantization_config
+        )
+        model_configs.append(model_config)
 
     monitor = GPUMonitor()
 
+    # Initialize decoder based on strategy
     if args.strategy == 'greedy':
-        verify = amusd.ModelConfig(args.verify_model_path, "cuda:0", torch.float16)
-        decoder = amusd.GreedyDecoder(verify, max_new_tokens=MAX_NEW_TOKENS)
+        decoder = decoding.GreedyDecoder(model_configs[-1], max_new_tokens=MAX_NEW_TOKENS)
     elif args.strategy == 'sd':
-        draft = amusd.ModelConfig(args.draft_model_path, "cuda:0", torch.float16)
-        verify = amusd.ModelConfig(args.verify_model_path, "cuda:0", torch.float16)
-        decoder = amusd.SyncSpeculativeDecoder(draft, verify, max_new_tokens=MAX_NEW_TOKENS)
+        if len(model_configs) < 2:
+            raise ValueError("sd strategy requires at least 2 models")
+        decoder = decoding.SyncSpeculativeDecoder(
+            model_configs[0], 
+            model_configs[-1], 
+            max_new_tokens=MAX_NEW_TOKENS
+        )
     elif args.strategy == 'amusd':
-        draft = amusd.ModelConfig(args.draft_model_path, "cuda:1", torch.float16)
-        verify = amusd.ModelConfig(args.verify_model_path, "cuda:0", torch.float16)
-        decoder = amusd.AsyncMultiGPUSpeculativeDecoder(draft, verify, max_new_tokens=MAX_NEW_TOKENS)
+        if len(model_configs) < 2:
+            raise ValueError("amusd strategy requires at least 2 models")
+        decoder = decoding.AsyncMultiGPUSpeculativeDecoder(
+            model_configs[0],
+            model_configs[-1],
+            max_new_tokens=MAX_NEW_TOKENS
+        )
+    elif args.strategy == 'three-model':
+        if len(model_configs) < 3:
+            raise ValueError("three-model strategy requires at least 3 models")
+        decoder = decoding.ThreeStageSpeculativeDecoder(
+            model_configs[0],  # small
+            model_configs[1],  # medium
+            model_configs[2],  # large
+            lookahead=args.lookahead,
+            max_new_tokens=MAX_NEW_TOKENS
+        )
+    elif args.strategy == 'amusd-three':
+        if len(model_configs) < 3:
+            raise ValueError("amusd-three strategy requires at least 3 models")
+        decoder = decoding.ThreeStageAsyncSpeculativeDecoder(
+            model_configs[0],  # small
+            model_configs[1],  # medium
+            model_configs[2],  # large
+            max_new_tokens=MAX_NEW_TOKENS
+        )
 
-    tok = AutoTokenizer.from_pretrained(verify.model_path)
+    # Load tokenizer from the largest model
+    tok = AutoTokenizer.from_pretrained(model_configs[-1].model_path)
 
     try:
         dataset = load_dataset(args.dataset)
@@ -42,17 +119,16 @@ if __name__ == "__main__":
         dataset = load_from_disk(args.dataset)
 
     conversation = dataset[args.sample_index]['conversation']
-
     last_assistant_turn = next((turn for turn in reversed(conversation) if turn['role'] == 'assistant'), None)
     if last_assistant_turn is None:
         last_turn_index = len(conversation)
     else:
         last_turn_index = conversation.index(last_assistant_turn)
-
+    
     conversation = conversation[:last_turn_index]
-
     input_ids = tok.apply_chat_template(conversation, return_tensors="pt")
 
+    # Generate and monitor
     monitor.start()
     output_ids, metrics = decoder.generate(input_ids, return_metrics=True)
     monitor.stop()
@@ -61,5 +137,5 @@ if __name__ == "__main__":
     print(tok.decode(output_ids, skip_special_tokens=True))
     print(metrics)
 
-    if args.strategy == 'amusd':
+    if hasattr(decoder, 'close'):
         decoder.close()
