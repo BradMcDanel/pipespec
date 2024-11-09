@@ -807,3 +807,292 @@ class AsyncMultiGPUSpeculativeDecoder:
             self.pool.join()
             self.pool = None
 
+@dataclass
+class SharedChainMemory:
+    """Shared memory matching baseline functionality"""
+    input_tensor: torch.Tensor
+    chain_tensors: List[torch.Tensor]  # Replaces draft/verify tensors
+    rollback_requests: torch.Tensor    # Keep counter-based approach
+    rollback_responses: torch.Tensor   # Keep counter-based approach
+    execution_times: torch.Tensor      # Combined times tensor
+    accepted_tokens: torch.Tensor
+    position_indices: torch.Tensor     # Track indices per position
+
+@dataclass
+class ChainState:
+    """Represents state for a single model in the chain"""
+    curr: Optional[torch.Tensor] = None      # Current tensor being processed
+    past_key_values: Optional[DynamicCache] = None  # KV cache for the model
+    num_input_tokens: int = -1              # Number of input tokens processed
+    
+    @property
+    def last_token(self):
+        """Get the last token from current tensor"""
+        return self.curr[:, -1:] if self.curr is not None else None
+    
+    @property
+    def num_tokens(self):
+        """Get number of tokens in current tensor"""
+        return self.curr.size(1) if self.curr is not None else 0
+
+    def step_output(self) -> Dict[str, Any]:
+        """Convert state to step output format"""
+        return {
+            "output_ids": self.curr,
+            "past_key_values": self.past_key_values,
+            "num_input_tokens": self.num_input_tokens
+        }
+
+    @classmethod
+    def from_step_output(cls, outputs: Dict[str, Any]) -> 'ChainState':
+        """Create state from step output"""
+        return cls(
+            curr=outputs["output_ids"],
+            past_key_values=outputs["past_key_values"],
+            num_input_tokens=outputs["num_input_tokens"]
+        )
+
+@dataclass
+class ChainEvents:
+    """Event system matching baseline behavior"""
+    def __init__(self, manager: mp.Manager, num_positions: int):
+        self.start = manager.Event()
+        self.completion = manager.Event()
+        self.close = manager.Event()
+        self.ready = [manager.Event() for _ in range(num_positions)]
+        self.reset = [manager.Event() for _ in range(num_positions)]
+        
+    def wait_all_ready(self):
+        for event in self.ready:
+            event.wait()
+            
+    def wait_reset(self, position: int):
+        """Wait for position reset"""
+        self.reset[position].wait()
+        self.reset[position].clear()
+
+class ChainSpeculativeDecoder:
+    """Chain-based speculative decoder with improved event handling"""
+    def __init__(self, draft_config: ModelConfig, verify_config: ModelConfig,
+                 max_new_tokens: int = 4096, max_length: int = 8096,
+                 max_log_entries: int = 10000):
+        self.model_configs = [draft_config, verify_config]
+        self.max_new_tokens = max_new_tokens
+        self.max_length = max_length
+        self.max_log_entries = max_log_entries
+        self.num_positions = len(self.model_configs)
+        self._init_shared_memory()
+        self._init_multiprocessing()
+    
+    def _init_shared_memory(self):
+        self.shared_memory = SharedChainMemory(
+            input_tensor=torch.zeros(self.max_length + 1, dtype=torch.long).share_memory_(),
+            chain_tensors=[torch.zeros(self.max_length + 1, dtype=torch.long).share_memory_() 
+                          for _ in range(self.num_positions)],
+            rollback_requests=torch.zeros(1, dtype=torch.int32).share_memory_(),
+            rollback_responses=torch.zeros(1, dtype=torch.int32).share_memory_(),
+            execution_times=torch.zeros((self.num_positions, self.max_log_entries), 
+                                     dtype=torch.float32).share_memory_(),
+            accepted_tokens=torch.zeros(self.max_log_entries, dtype=torch.int32).share_memory_(),
+            position_indices=torch.zeros(self.num_positions, dtype=torch.int32).share_memory_()
+        )
+
+    def _init_multiprocessing(self):
+        self.manager = mp.Manager()
+        self.events = ChainEvents(self.manager, self.num_positions)
+        self.pool = mp.Pool(processes=self.num_positions)
+        self._start_processes()
+
+    def _start_processes(self):
+        self.processes = []
+        for i, config in enumerate(self.model_configs):
+            process = self.pool.apply_async(self._chain_process, 
+                                          (i, config, self.shared_memory, self.events, self.max_new_tokens))
+            self.processes.append(process)
+        
+        self.events.wait_all_ready()
+
+    @staticmethod
+    def _chain_process(position: int, model_config: ModelConfig,
+                      sm: SharedChainMemory, events: ChainEvents, max_new_tokens: int):
+        try:
+            model, tokenizer = init_model(model_config)
+            events.ready[position].set()
+            
+            while True:
+                events.start.wait()
+                if events.close.is_set():
+                    break
+                    
+                state = ChainState()
+                if position == 0:  # Draft
+                    input_ids = get_sm_tensor(sm.input_tensor).to(model_config.device)
+                    outputs = step(model, input_ids)
+                    state.curr = outputs["output_ids"]
+                    state.past_key_values = outputs["past_key_values"]
+                    state.num_input_tokens = outputs["num_input_tokens"]
+                    
+                    put_sm_tensor(state.curr, sm.chain_tensors[position])
+                    
+                    local_index = 0
+                    handled_rollback = False
+                    while not events.completion.is_set():
+                        start_time = time.time()
+
+                        # Handle rollback using counter-based approach
+                        if sm.rollback_requests[0] > sm.rollback_responses[0] and not handled_rollback:
+                            verify_output_ids = get_sm_tensor(sm.chain_tensors[position + 1])
+                            # Moved _handle_rollback logic here
+                            draft_inputs = build_draft_inputs(
+                                verify_output_ids,
+                                state.curr[:, -1:],
+                                state.curr,
+                                state.past_key_values,
+                                state.num_input_tokens
+                            )
+                            state.curr = draft_inputs["output_ids"]
+                            state.past_key_values = draft_inputs["past_key_values"]
+                            handled_rollback = True
+
+                        # Generate next token
+                        outputs = step(model, state.curr[:, -1:],
+                                     state.curr, state.past_key_values,
+                                     state.num_input_tokens)
+                        state.curr = outputs["output_ids"]
+                        state.past_key_values = outputs["past_key_values"]
+                        
+                        put_sm_tensor(state.curr, sm.chain_tensors[position])
+
+                        # Signal rollback completion
+                        if sm.rollback_requests[0] > sm.rollback_responses[0] and handled_rollback:
+                            sm.rollback_responses[0] += 1
+                            handled_rollback = False
+                        
+                        end_time = time.time()
+                        elapsed_time = end_time - start_time
+                        update_log(sm.execution_times[position],
+                                 sm.position_indices[position:position+1],
+                                 local_index, elapsed_time)
+                        local_index += 1
+
+                    sm.position_indices[position] = local_index
+                    events.reset[position].set()
+                    
+                else:  # Verify
+                    input_ids = get_sm_tensor(sm.input_tensor).to(model_config.device)
+                    outputs = step(model, input_ids)
+                    state.curr = outputs["output_ids"]
+                    state.past_key_values = outputs["past_key_values"]
+                    state.num_input_tokens = outputs["num_input_tokens"]
+                    
+                    put_sm_tensor(state.curr, sm.chain_tensors[position])
+                    
+                    local_index = 0
+                    while state.curr.size(1) < max_new_tokens: 
+                        start_time = time.time()
+
+                        # Wait for draft rollback completion
+                        while sm.rollback_requests[0] > sm.rollback_responses[0]:
+                            time.sleep(0.001)
+
+                        # Get draft tokens and verify
+                        draft_output_ids = get_sm_tensor(sm.chain_tensors[position-1])
+                        verify_inputs = build_verify_inputs(draft_output_ids, 
+                                                          state.curr[:, -1:],
+                                                          state.curr,
+                                                          state.past_key_values,
+                                                          state.num_input_tokens)
+                        verify_outputs = verify_step(model, **verify_inputs)
+                        
+                        state.curr = verify_outputs["output_ids"]
+                        state.past_key_values = verify_outputs["past_key_values"]
+                        
+                        put_sm_tensor(state.curr, sm.chain_tensors[position])
+
+                        # Request rollback if needed
+                        if not verify_outputs["all_tokens_were_verified"] or \
+                           verify_outputs["num_verified_tokens"] == 1:
+                            sm.rollback_requests[0] += 1
+
+                        end_time = time.time()
+                        elapsed_time = end_time - start_time
+                        update_log(sm.execution_times[position],
+                                 sm.position_indices[position:position+1],
+                                 local_index, elapsed_time)
+                        sm.accepted_tokens[local_index] = verify_outputs["num_verified_tokens"]
+                        local_index += 1
+                        
+                        # Check for EOS token
+                        if tokenizer.eos_token_id in state.curr[0, -verify_outputs["num_verified_tokens"]:]:
+                            eos_index = (state.curr[0] == tokenizer.eos_token_id).nonzero(as_tuple=True)[0][-1].item()
+                            state.curr = state.curr[:, :eos_index+1]
+                            events.completion.set()
+                            break
+                    
+                    sm.position_indices[position] = local_index
+                
+                events.start.clear()
+                
+        except Exception as e:
+            print(f"Exception in chain process at position {position}: {e}")
+            traceback.print_exc()
+
+
+    def generate(self, input_ids, return_metrics=False):
+        self._reset_shared_memory()
+        
+        # Setup input
+        input_length = input_ids.size(1)
+        self.shared_memory.input_tensor[0] = input_length
+        self.shared_memory.input_tensor[1:1+input_length] = input_ids[0]
+        
+        # Start generation
+        self.events.completion.clear()
+        self.events.start.set()
+        
+        # Wait for completion and measure time
+        start_time = time.time()
+        self.events.completion.wait()
+        total_time = time.time() - start_time
+        
+        # Wait for draft reset
+        self.events.wait_reset(0)
+        
+        final_output = get_sm_tensor(self.shared_memory.chain_tensors[1])[0]
+        tokens_generated = len(final_output)
+        time_per_token = total_time / tokens_generated if tokens_generated > 0 else 0
+        
+        # Format metrics to match baseline
+        metrics = {
+            "draft_times": self.shared_memory.execution_times[0][:self.shared_memory.position_indices[0]].tolist(),
+            "verify_times": self.shared_memory.execution_times[1][:self.shared_memory.position_indices[1]].tolist(),
+            "accepted_tokens": self.shared_memory.accepted_tokens[:self.shared_memory.position_indices[1]].tolist(),
+            "total_time": total_time,
+            "tokens_generated": tokens_generated,
+            "time_per_token": time_per_token
+        }
+        
+        if return_metrics:
+            return final_output, metrics
+            
+        return final_output
+
+    def _reset_shared_memory(self):
+        """Reset all shared memory tensors"""
+        self.shared_memory.input_tensor.fill_(0)
+        for tensor in self.shared_memory.chain_tensors:
+            tensor.fill_(0)
+        self.shared_memory.rollback_requests.fill_(0)
+        self.shared_memory.rollback_responses.fill_(0)
+        self.shared_memory.execution_times.fill_(0)
+        self.shared_memory.accepted_tokens.fill_(0)
+        self.shared_memory.position_indices.fill_(0)
+    
+    def close(self):
+        """Clean up multiprocessing resources"""
+        self.events.close.set()
+        self.events.start.set()
+        if hasattr(self, 'pool') and self.pool is not None:
+            self.pool.close()
+            self.pool.join()
+            self.pool = None

@@ -15,7 +15,7 @@ MAX_NEW_TOKENS = 4096
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--strategy", type=str, default="three-model", 
-                      choices=["greedy", "sd", "amusd", "three-model", "amusd-three"],
+                      choices=["greedy", "sd", "amusd", "three-model", "amusd-three", "chain"],
                       help="Decoding strategy (three-model=sync, amusd-three=async)")
     parser.add_argument("--dataset", type=str, required=True,
                       help="Path or name of the dataset to use")
@@ -76,6 +76,14 @@ if __name__ == "__main__":
             model_configs[1],  # medium
             model_configs[2],  # large
             lookahead=args.lookahead,
+            max_new_tokens=MAX_NEW_TOKENS
+        )
+    elif args.strategy == 'chain':
+        if len(model_configs) < 2:
+            raise ValueError("chain strategy requires at least 2 models")
+        decoder = decoding.ChainSpeculativeDecoder(
+            model_configs[0],
+            model_configs[-1],
             max_new_tokens=MAX_NEW_TOKENS
         )
     elif args.strategy == 'amusd-three':
