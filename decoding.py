@@ -1,4 +1,5 @@
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Optional, Union, Dict, Any, List
 
@@ -52,14 +53,14 @@ def step(model, input_ids, output_ids=None, past_key_values=None, num_input_toke
         "past_key_values": past_key_values
     }
 
-def build_verify_inputs(draft_output_ids, input_ids, output_ids, past_key_values, num_input_tokens):
+def build_verify_inputs(draft_output_ids, input_ids, output_ids, past_key_values, num_input_tokens, **kwargs):
     draft_ids = draft_output_ids.to(output_ids.device)
 
     # Get lengths of both tensors
     verify_len = output_ids.size(1)
     draft_len = draft_ids.size(1)
 
-    # Case 1: Valid state is longer or tokens are different (we don't do anything)
+    # Case 1: Valid state is longer or tokens are different (we don't take the draft tokens)
     if verify_len > draft_len or not torch.equal(output_ids[:, :verify_len], draft_ids[:, :verify_len]):
         pass
     else:
@@ -112,29 +113,32 @@ def perform_verification(input_ids, verify_outputs, output_ids, past_key_values,
     # Crop past_key_values if necessary (assuming crop is properly defined)
     past_key_values.crop(num_input_tokens + output_ids.size(1) - 1)
     
-    return output_ids, input_ids, past_key_values
+    return output_ids, input_ids, past_key_values, verified_ids.size(1)
 
 
-def verify_step(model, input_ids, output_ids, past_key_values, num_input_tokens):
+def verify_step(model, input_ids, output_ids, past_key_values, num_input_tokens, **kwargs):
     # (1) Model forward pass
     with torch.no_grad():
         verify_outputs = model(input_ids=input_ids, past_key_values=past_key_values, use_cache=True)
     
     # (2) Verification and update process
     if input_ids.size(1) > 1:
-        output_ids, input_ids, past_key_values = perform_verification(
+        output_ids, input_ids, past_key_values, num_verified_tokens = perform_verification(
             input_ids, verify_outputs, output_ids, past_key_values, num_input_tokens
         )
     else:
         next_token_logits = verify_outputs.logits[:, -1, :]
         input_ids = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
         output_ids = torch.cat([output_ids, input_ids], dim=1)
+        num_verified_tokens = 1
 
     return {
         "input_ids": input_ids,
         "output_ids": output_ids,
         "past_key_values": past_key_values,
-        "num_input_tokens": num_input_tokens
+        "num_input_tokens": num_input_tokens,
+        "all_tokens_were_verified": num_verified_tokens == input_ids.size(1),
+        "num_verified_tokens": num_verified_tokens
     }
 
 @dataclass
@@ -552,6 +556,21 @@ class SharedMemory:
     draft_index: torch.Tensor
     verify_index: torch.Tensor
 
+def put_sm_tensor(src_tensor, sm_tensor):
+    src_tensor = src_tensor.squeeze(0)
+    sm_tensor[0] = src_tensor.size(0)
+    sm_tensor[1:src_tensor.size(0)+1] = src_tensor
+
+def get_sm_tensor(sm_tensor):
+    return sm_tensor[1:sm_tensor[0].item()+1].unsqueeze(0)
+
+def update_log(times_tensor, index_tensor, idx, elapsed_time):
+    if idx >= times_tensor.size(0):
+        raise ValueError("Exceeded maximum log entries")
+    times_tensor[idx] = elapsed_time
+    idx += 1
+    index_tensor[0] = idx
+
 class AsyncMultiGPUSpeculativeDecoder:
     def __init__(self, draft_config: ModelConfig, verify_config: ModelConfig, 
                  max_new_tokens: int = 4096, max_length: int = 8096, 
@@ -592,24 +611,23 @@ class AsyncMultiGPUSpeculativeDecoder:
         self._start_processes()
 
     def _start_processes(self):
-        self.verify_process = self.pool.apply_async(self._verify_process, (
-            self.verify_config, self.shared_memory,
-            self.verify_ready_event, self.start_event, self.completion_event, 
-            self.close_event, self.max_log_entries, self.max_new_tokens
-        ))
         self.draft_process = self.pool.apply_async(self._draft_process, (
             self.draft_config, self.shared_memory,
             self.draft_ready_event, self.draft_reset_event, self.start_event, self.completion_event, 
-            self.close_event, self.max_log_entries
+            self.close_event
         ))
-        
+        self.verify_process = self.pool.apply_async(self._verify_process, (
+            self.verify_config, self.shared_memory,
+            self.verify_ready_event, self.start_event, self.completion_event, 
+            self.close_event, self.max_new_tokens
+        ))
+
         self.draft_ready_event.wait()
         self.verify_ready_event.wait()
 
     @staticmethod
-    def _draft_process(config: ModelConfig, shared_memory: SharedMemory, 
-                       ready_event, reset_event, start_event, completion_event, close_event, 
-                       max_log_entries):
+    def _draft_process(config: ModelConfig, sm: SharedMemory, 
+                       ready_event, reset_event, start_event, completion_event, close_event):
         try:
             draft_model, _ = init_model(config)
             ready_event.set()
@@ -618,64 +636,51 @@ class AsyncMultiGPUSpeculativeDecoder:
                 start_event.wait()
                 if close_event.is_set():
                     break
-                input_ids = shared_memory.input_tensor[1:shared_memory.input_tensor[0].item() + 1].unsqueeze(0).to(config.device)
-                # wait for initial verify token
-                while shared_memory.verify_tensor[0].item() == 0:
-                    time.sleep(0.0001)
 
+                # Initialize draft state
+                input_ids = get_sm_tensor(sm.input_tensor).to(config.device)
                 draft_state = step(draft_model, input_ids)
-
-                verify_output_ids = shared_memory.verify_tensor[1:shared_memory.verify_tensor[0].item()+1].unsqueeze(0)
-                last_verify_length = verify_output_ids.size(1)
-                draft_state = build_draft_inputs(verify_output_ids, **draft_state)
-
-                draft_state = step(draft_model, input_ids)
-
-                shared_memory.draft_tensor[1:1+draft_state["output_ids"].size(1)] = draft_state["output_ids"]
-                shared_memory.draft_tensor[0] = draft_state["output_ids"].size(1)
+                
+                # Write to shared memory
+                put_sm_tensor(draft_state["output_ids"], sm.draft_tensor)
             
                 local_index = 0
+                handled_rollback = False
                 while not completion_event.is_set():
                     start_time = time.time()
 
-                    draft_state = step(draft_model, **draft_state)
-
-                    # write to shared memory
-                    output_ids = draft_state["output_ids"]
-                    shared_memory.draft_tensor[1:1+output_ids.size(1)] = output_ids
-                    shared_memory.draft_tensor[0] = output_ids.size(1)
-                
-                    verify_length = shared_memory.verify_tensor[0].item()
-
-                    # Verify update occured
-                    if verify_length > last_verify_length:
-                        last_draft_length = draft_state["output_ids"].size(1)
-                        verify_output_ids = shared_memory.verify_tensor[1:verify_length+1].unsqueeze(0)
+                    # Rollback Triggered: update draft state with verify tokens
+                    if sm.rollback_requests[0] > sm.rollback_responses[0] and not handled_rollback:
+                        verify_output_ids = get_sm_tensor(sm.verify_tensor)
                         draft_state = build_draft_inputs(verify_output_ids, **draft_state)
-                        draft_length = draft_state["output_ids"].size(1)
-                        last_verify_length = verify_length
-                        
-                        # Rollback occured
-                        if draft_length < last_draft_length:
-                            shared_memory.rollback_responses[0] += 1
+                        handled_rollback = True
 
+                    # Compute next draft tokens
+                    draft_state = step(draft_model, **draft_state)
+                    put_sm_tensor(draft_state["output_ids"], sm.draft_tensor)
+
+                    # Rollback Complete: signal verify process that rollback is complete
+                    if sm.rollback_requests[0] > sm.rollback_responses[0] and handled_rollback:
+                        sm.rollback_responses[0] += 1
+                        handled_rollback = False
+                
                     end_time = time.time()
 
                     # Log draft time
-                    idx = local_index % max_log_entries
-                    shared_memory.draft_times[idx] = end_time - start_time
+                    elapsed_time = end_time - start_time
+                    update_log(sm.draft_times, sm.draft_index, local_index, elapsed_time)
                     local_index += 1
-                    shared_memory.draft_index[0] = local_index
-                
-                shared_memory.draft_index[0] = local_index
+
+                sm.draft_index[0] = local_index
                 reset_event.set()
         except Exception as e:
             print(f"Exception in draft process: {e}")
+            traceback.print_exc()
 
     @staticmethod
-    def _verify_process(config: ModelConfig, shared_memory: SharedMemory, 
+    def _verify_process(config: ModelConfig, sm: SharedMemory, 
                         ready_event, start_event, completion_event, close_event, 
-                        max_log_entries, max_new_tokens):
+                        max_new_tokens):
         try:
             verify_model, tok = init_model(config)
             ready_event.set()
@@ -685,51 +690,44 @@ class AsyncMultiGPUSpeculativeDecoder:
                 if close_event.is_set():
                     break
 
-
-                input_ids = shared_memory.input_tensor[1:shared_memory.input_tensor[0].item() + 1].unsqueeze(0).to(config.device)
+                # Initialize verify state
+                input_ids = get_sm_tensor(sm.input_tensor).to(config.device)
                 verify_state = step(verify_model, input_ids)
+
+                # Write to shared memory
+                put_sm_tensor(verify_state["output_ids"], sm.verify_tensor)
                 
                 local_index = 0
                 while verify_state["output_ids"].size(1) < max_new_tokens:
                     start_time = time.time()
 
-                    # inform draft process of new verify token(s)
-                    output_ids = verify_state["output_ids"]
-                    shared_memory.verify_tensor[1:1+output_ids.size(1)] = output_ids
-                    shared_memory.verify_tensor[0] = output_ids.size(1)
+                    # Wait for draft to confirm rollback
+                    while sm.rollback_requests[0] > sm.rollback_responses[0]:
+                        time.sleep(0.001)
 
-                    # rollback check if necessary
-                    while shared_memory.rollback_requests[0] > shared_memory.rollback_responses[0]:
-                        time.sleep(0.0001)
-
-                    while shared_memory.draft_tensor[0].item() <= shared_memory.verify_tensor[0].item() + 1:
-                        time.sleep(0.0001)
-
-                    draft_length = shared_memory.draft_tensor[0].item()
-                    draft_output_ids = shared_memory.draft_tensor[1:draft_length+1].unsqueeze(0)
-                    num_old_verified_tokens = verify_state["output_ids"].size(1)
-
+                    # Get draft tokens
+                    draft_output_ids = get_sm_tensor(sm.draft_tensor)
                     verify_state = build_verify_inputs(draft_output_ids, **verify_state)
-
-                    num_draft_tokens = verify_state["input_ids"].size(1)
-
                     verify_state = verify_step(verify_model, **verify_state)
-                    
-                    # Not all draft tokens were accepted, so draft process should rollback to the last verified token
-                    num_new_verified_tokens = verify_state["output_ids"].size(1) - num_old_verified_tokens
-                    if num_new_verified_tokens != num_draft_tokens:
-                        shared_memory.rollback_requests[0] += 1
+
+                    # Write to shared memory
+                    put_sm_tensor(verify_state["output_ids"], sm.verify_tensor)
+
+                    if not verify_state["all_tokens_were_verified"] or \
+                        verify_state["num_verified_tokens"] == 1:
+                        sm.rollback_requests[0] += 1
 
                     end_time = time.time()
 
                     # Log metrics
-                    idx = local_index % max_log_entries
-                    shared_memory.verify_times[idx] = end_time - start_time
-                    shared_memory.accepted_tokens[idx] = num_new_verified_tokens
+                    elapsed_time = end_time - start_time
+                    update_log(sm.verify_times, sm.verify_index, local_index, elapsed_time)
+                    sm.accepted_tokens[local_index] = verify_state["num_verified_tokens"]
                     local_index += 1
                     
                     # Check only newly generated tokens for eos_token_id
-                    if tok.eos_token_id in verify_state["output_ids"][0, -num_new_verified_tokens:]:
+                    end_slice = verify_state["output_ids"][0, -verify_state["num_verified_tokens"]:]
+                    if tok.eos_token_id in end_slice:
                         # find eos_token_id
                         eos_index = (verify_state["output_ids"][0] == tok.eos_token_id).nonzero(as_tuple=True)[0][-1].item()
                         # trim output_ids
@@ -737,13 +735,14 @@ class AsyncMultiGPUSpeculativeDecoder:
                         break
 
                 
-                shared_memory.verify_tensor[0] = verify_state["output_ids"].size(1)
-                shared_memory.verify_tensor[1:1+shared_memory.verify_tensor[0].item()] = verify_state["output_ids"]
-                shared_memory.verify_index[0] = local_index
+                # Write final results to shared memory
+                put_sm_tensor(verify_state["output_ids"], sm.verify_tensor)
+                sm.verify_index[0] = local_index
                 start_event.clear()
                 completion_event.set()
         except Exception as e:
             print(f"Exception in verify process: {e}")
+            traceback.print_exc()
 
     def generate(self, input_ids, return_metrics=False):
         # Send input_ids to shared memory
@@ -942,16 +941,10 @@ class ThreeStageAsyncSpeculativeDecoder:
                     medium_length = shared_memory.medium_tensor[0].item()
 
                     # Verify update occured
-                    if medium_length > last_medium_length:
-                        last_small_length = small_state["output_ids"].size(1)
+                    if shared_memory.small_medium_rollback_requests[0] > shared_memory.small_medium_rollback_responses[0]:
                         medium_output_ids = shared_memory.medium_tensor[1:medium_length+1].unsqueeze(0)
                         small_state = build_draft_inputs(medium_output_ids, **small_state)
-                        small_length = small_state["output_ids"].size(1)
-                        last_medium_length = medium_length
-                        
-                        # Rollback occured
-                        if small_length < last_small_length:
-                            shared_memory.small_medium_rollback_responses[0] += 1
+                        shared_memory.small_medium_rollback_responses[0] += 1
 
                     end_time = time.time()
 
@@ -1030,16 +1023,10 @@ class ThreeStageAsyncSpeculativeDecoder:
                     large_length = shared_memory.large_tensor[0].item()
 
                     # Verify update occured
-                    if large_length > last_large_length:
-                        last_medium_length = medium_state["output_ids"].size(1)
+                    if shared_memory.medium_large_rollback_requests[0] > shared_memory.medium_large_rollback_responses[0]:
                         large_output_ids = shared_memory.large_tensor[1:large_length+1].unsqueeze(0)
                         medium_state = build_draft_inputs(large_output_ids, **medium_state)
-                        medium_length = medium_state["output_ids"].size(1)
-                        last_large_length = large_length
-                        
-                        # Rollback occured
-                        if medium_length < last_medium_length:
-                            shared_memory.medium_large_rollback_responses[0] += 1
+                        shared_memory.medium_large_rollback_responses[0] += 1
 
                     end_time = time.time()
 
