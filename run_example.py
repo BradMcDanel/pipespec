@@ -81,11 +81,7 @@ if __name__ == "__main__":
     elif args.strategy == 'chain':
         if len(model_configs) < 2:
             raise ValueError("chain strategy requires at least 2 models")
-        decoder = decoding.ChainSpeculativeDecoder(
-            model_configs[0],
-            model_configs[-1],
-            max_new_tokens=MAX_NEW_TOKENS
-        )
+        decoder = decoding.ChainSpeculativeDecoder(model_configs, max_new_tokens=MAX_NEW_TOKENS)
     elif args.strategy == 'amusd-three':
         if len(model_configs) < 3:
             raise ValueError("amusd-three strategy requires at least 3 models")
