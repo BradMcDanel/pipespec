@@ -23,35 +23,14 @@ if __name__ == "__main__":
                       help="Index of the sample to use from the dataset")
     parser.add_argument("--lookahead", type=int, default=4,
                       help="Number of tokens to look ahead in speculative decoding")
-    
-    # Models configuration
-    parser.add_argument("--models", type=str, required=True, help="""
-        JSON array of model configurations. Example:
-        [
-            {
-                "path": "meta-llama/Llama-3.2-1B-Instruct",
-                "devices": ["cuda:2"],
-                "dtype": "float16"
-            },
-            {
-                "path": "meta-llama/Llama-3.1-8B-Instruct",
-                "devices": ["cuda:1"],
-                "dtype": "bfloat16"
-            },
-            {
-                "path": "meta-llama/Meta-Llama-3.1-70B-Instruct",
-                "devices": ["cuda:0", "cuda:1"],
-                "dtype": "bfloat16",
-                "quantize": "4bit"
-            }
-        ]
-        """)
-
+    parser.add_argument("--models-config-path", type=str, required=True, help="Path to the model configs")
     args = parser.parse_args()
 
     # Parse model configurations
     model_configs = []
-    models_json = json.loads(args.models)
+    with open(args.models_config_path, 'r') as f:
+        models_json = json.load(f)
+
     for cfg in models_json:
         dtype = torch.bfloat16 if cfg.get('dtype', 'float16') == 'bfloat16' else torch.float16
         quantization_config = None
