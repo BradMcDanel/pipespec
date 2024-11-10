@@ -117,8 +117,8 @@ if __name__ == "__main__":
     monitor.stop()
     metrics["gpustats"] = monitor.get_results()
     
-    print(tok.decode(output_ids, skip_special_tokens=True))
-    print(metrics)
+    # print(tok.decode(output_ids, skip_special_tokens=True))
+    print(metrics["time_per_token"])
 
     if hasattr(decoder, 'close'):
         decoder.close()
