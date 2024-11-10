@@ -60,14 +60,6 @@ if __name__ == "__main__":
             model_configs[-1], 
             max_new_tokens=MAX_NEW_TOKENS
         )
-    elif args.strategy == 'amusd':
-        if len(model_configs) < 2:
-            raise ValueError("amusd strategy requires at least 2 models")
-        decoder = decoding.AsyncMultiGPUSpeculativeDecoder(
-            model_configs[0],
-            model_configs[-1],
-            max_new_tokens=MAX_NEW_TOKENS
-        )
     elif args.strategy == 'three-model':
         if len(model_configs) < 3:
             raise ValueError("three-model strategy requires at least 3 models")
@@ -117,8 +109,9 @@ if __name__ == "__main__":
     monitor.stop()
     metrics["gpustats"] = monitor.get_results()
     
-    # print(tok.decode(output_ids, skip_special_tokens=True))
+    print(tok.decode(output_ids, skip_special_tokens=True))
     print(metrics["time_per_token"])
+    # print(metrics)
 
     if hasattr(decoder, 'close'):
         decoder.close()

@@ -571,244 +571,6 @@ def update_log(times_tensor, index_tensor, idx, elapsed_time):
     idx += 1
     index_tensor[0] = idx
 
-class AsyncMultiGPUSpeculativeDecoder:
-    def __init__(self, draft_config: ModelConfig, verify_config: ModelConfig, 
-                 max_new_tokens: int = 4096, max_length: int = 8096, 
-                 max_log_entries: int = 10000):
-        self.draft_config = draft_config
-        self.verify_config = verify_config
-        self.max_new_tokens = max_new_tokens
-        self.max_length = max_length
-        self.max_log_entries = max_log_entries
-
-        self._init_shared_memory()
-        self._init_multiprocessing()
-
-    def _init_shared_memory(self):
-        self.shared_memory = SharedMemory(
-            input_tensor=torch.zeros(self.max_length + 1, dtype=torch.long).share_memory_(),
-            draft_tensor=torch.zeros(self.max_length + 1, dtype=torch.long).share_memory_(),
-            rollback_requests=torch.zeros(1, dtype=torch.int32).share_memory_(),
-            rollback_responses=torch.zeros(1, dtype=torch.int32).share_memory_(),
-            verify_tensor=torch.zeros(self.max_length + 1, dtype=torch.long).share_memory_(),
-            draft_times=torch.zeros(self.max_log_entries, dtype=torch.float32).share_memory_(),
-            verify_times=torch.zeros(self.max_log_entries, dtype=torch.float32).share_memory_(),
-            accepted_tokens=torch.zeros(self.max_log_entries, dtype=torch.int32).share_memory_(),
-            draft_index=torch.tensor([0], dtype=torch.int32).share_memory_(),
-            verify_index=torch.tensor([0], dtype=torch.int32).share_memory_()
-        )
-
-    def _init_multiprocessing(self):
-        self.manager = mp.Manager()
-        self.draft_ready_event = self.manager.Event()
-        self.draft_reset_event = self.manager.Event()
-        self.verify_ready_event = self.manager.Event()
-        self.start_event = self.manager.Event()
-        self.completion_event = self.manager.Event()
-        self.close_event = self.manager.Event()
-
-        self.pool = mp.Pool(processes=2)
-        self._start_processes()
-
-    def _start_processes(self):
-        self.draft_process = self.pool.apply_async(self._draft_process, (
-            self.draft_config, self.shared_memory,
-            self.draft_ready_event, self.draft_reset_event, self.start_event, self.completion_event, 
-            self.close_event
-        ))
-        self.verify_process = self.pool.apply_async(self._verify_process, (
-            self.verify_config, self.shared_memory,
-            self.verify_ready_event, self.start_event, self.completion_event, 
-            self.close_event, self.max_new_tokens
-        ))
-
-        self.draft_ready_event.wait()
-        self.verify_ready_event.wait()
-
-    @staticmethod
-    def _draft_process(config: ModelConfig, sm: SharedMemory, 
-                       ready_event, reset_event, start_event, completion_event, close_event):
-        try:
-            draft_model, _ = init_model(config)
-            ready_event.set()
-
-            while True:
-                start_event.wait()
-                if close_event.is_set():
-                    break
-
-                # Initialize draft state
-                input_ids = get_sm_tensor(sm.input_tensor).to(config.device)
-                draft_state = step(draft_model, input_ids)
-                
-                # Write to shared memory
-                put_sm_tensor(draft_state["output_ids"], sm.draft_tensor)
-            
-                local_index = 0
-                handled_rollback = False
-                while not completion_event.is_set():
-                    start_time = time.time()
-
-                    # Rollback Triggered: update draft state with verify tokens
-                    if sm.rollback_requests[0] > sm.rollback_responses[0] and not handled_rollback:
-                        verify_output_ids = get_sm_tensor(sm.verify_tensor)
-                        draft_state = build_draft_inputs(verify_output_ids, **draft_state)
-                        handled_rollback = True
-
-                    # Compute next draft tokens
-                    draft_state = step(draft_model, **draft_state)
-                    put_sm_tensor(draft_state["output_ids"], sm.draft_tensor)
-
-                    # Rollback Complete: signal verify process that rollback is complete
-                    if sm.rollback_requests[0] > sm.rollback_responses[0] and handled_rollback:
-                        sm.rollback_responses[0] += 1
-                        handled_rollback = False
-                
-                    end_time = time.time()
-
-                    # Log draft time
-                    elapsed_time = end_time - start_time
-                    update_log(sm.draft_times, sm.draft_index, local_index, elapsed_time)
-                    local_index += 1
-
-                sm.draft_index[0] = local_index
-                reset_event.set()
-        except Exception as e:
-            print(f"Exception in draft process: {e}")
-            traceback.print_exc()
-
-    @staticmethod
-    def _verify_process(config: ModelConfig, sm: SharedMemory, 
-                        ready_event, start_event, completion_event, close_event, 
-                        max_new_tokens):
-        try:
-            verify_model, tok = init_model(config)
-            ready_event.set()
-            
-            while True:
-                start_event.wait()
-                if close_event.is_set():
-                    break
-
-                # Initialize verify state
-                input_ids = get_sm_tensor(sm.input_tensor).to(config.device)
-                verify_state = step(verify_model, input_ids)
-
-                # Write to shared memory
-                put_sm_tensor(verify_state["output_ids"], sm.verify_tensor)
-                
-                local_index = 0
-                while verify_state["output_ids"].size(1) < max_new_tokens:
-                    start_time = time.time()
-
-                    # Wait for draft to confirm rollback
-                    while sm.rollback_requests[0] > sm.rollback_responses[0]:
-                        time.sleep(0.001)
-
-                    # Get draft tokens
-                    draft_output_ids = get_sm_tensor(sm.draft_tensor)
-                    verify_state = build_verify_inputs(draft_output_ids, **verify_state)
-                    verify_state = verify_step(verify_model, **verify_state)
-
-                    # Write to shared memory
-                    put_sm_tensor(verify_state["output_ids"], sm.verify_tensor)
-
-                    if not verify_state["all_tokens_were_verified"] or \
-                        verify_state["num_verified_tokens"] == 1:
-                        sm.rollback_requests[0] += 1
-
-                    end_time = time.time()
-
-                    # Log metrics
-                    elapsed_time = end_time - start_time
-                    update_log(sm.verify_times, sm.verify_index, local_index, elapsed_time)
-                    sm.accepted_tokens[local_index] = verify_state["num_verified_tokens"]
-                    local_index += 1
-                    
-                    # Check only newly generated tokens for eos_token_id
-                    end_slice = verify_state["output_ids"][0, -verify_state["num_verified_tokens"]:]
-                    if tok.eos_token_id in end_slice:
-                        # find eos_token_id
-                        eos_index = (verify_state["output_ids"][0] == tok.eos_token_id).nonzero(as_tuple=True)[0][-1].item()
-                        # trim output_ids
-                        verify_state["output_ids"] = verify_state["output_ids"][:, :eos_index+1]
-                        break
-
-                
-                # Write final results to shared memory
-                put_sm_tensor(verify_state["output_ids"], sm.verify_tensor)
-                sm.verify_index[0] = local_index
-                start_event.clear()
-                completion_event.set()
-        except Exception as e:
-            print(f"Exception in verify process: {e}")
-            traceback.print_exc()
-
-    def generate(self, input_ids, return_metrics=False):
-        # Send input_ids to shared memory
-        input_length = input_ids.size(1)
-        self.shared_memory.input_tensor[0] = input_length
-        self.shared_memory.input_tensor[1:1+input_length] = input_ids[0]
-        
-        # Clear draft and verify tensors
-        self.shared_memory.draft_tensor.fill_(0)
-        self.shared_memory.verify_tensor.fill_(0)
-
-        # Start the processes
-        self.completion_event.clear()
-        self.start_event.set()
-
-        # Running the processes in parallel
-        start_time = time.time()
-        self.completion_event.wait()
-        total_time = time.time() - start_time
-
-        # wait for draft reset event
-        self.draft_reset_event.wait()
-        self.draft_reset_event.clear()
-
-        final_output_ids = self.shared_memory.verify_tensor[1:self.shared_memory.verify_tensor[0].item()+1].clone()
-        tokens_generated = len(final_output_ids)
-        time_per_token = total_time / tokens_generated
-
-        # Process logged metrics
-        num_draft_logs = min(self.shared_memory.draft_index[0].item(), self.max_log_entries)
-        num_verify_logs = min(self.shared_memory.verify_index[0].item(), self.max_log_entries)
-        draft_times = self.shared_memory.draft_times[:num_draft_logs].tolist()
-        verify_times = self.shared_memory.verify_times[:num_verify_logs].tolist()
-        accepted_tokens = self.shared_memory.accepted_tokens[:num_verify_logs].tolist()
-
-        metrics = {
-            "draft_times": draft_times,
-            "verify_times": verify_times,
-            "accepted_tokens": accepted_tokens,
-            "total_time": total_time,
-            "tokens_generated": tokens_generated,
-            "time_per_token": time_per_token
-        }
-
-        # Reset shared memory and indices
-        self._reset_shared_memory()
-
-        if return_metrics:
-            return final_output_ids, metrics
-
-        return final_output_ids
-
-    def _reset_shared_memory(self):
-        for tensor in vars(self.shared_memory).values():
-            tensor.fill_(0)
-
-    def close(self):
-        self.close_event.set()
-        self.start_event.set()
-        if hasattr(self, 'pool') and self.pool is not None:
-            self.pool.close()
-            self.pool.join()
-            self.pool = None
-
-
-
 @dataclass
 class ChainState:
     """Represents state for a single model in the chain"""
@@ -982,7 +744,7 @@ class ChainSpeculativeDecoder:
                                  local_index, elapsed_time)
                         local_index += 1
                 
-                elif position < num_positions - 1:  # Middle models (verify + draft)
+                elif position < num_positions - 1:  # Middle models (verify only)
                     prev_pair = position - 1  # Index for previous model pair
                     next_pair = position      # Index for next model pair
                     handled_rollback = False
@@ -994,7 +756,7 @@ class ChainSpeculativeDecoder:
                         while sm.rollback_requests[prev_pair] > sm.rollback_responses[prev_pair]:
                             time.sleep(0.001)
                             
-                        # Handle rollback from next model
+                        # If we got a rollback request from next model
                         if sm.rollback_requests[next_pair] > sm.rollback_responses[next_pair] and not handled_rollback:
                             verify_output_ids = get_sm_tensor(sm.chain_tensors[position + 1])
                             draft_inputs = build_draft_inputs(
@@ -1006,8 +768,8 @@ class ChainSpeculativeDecoder:
                             )
                             state = ChainState.from_step_output(draft_inputs)
                             handled_rollback = True
-                            
-                        # Verify tokens from previous model
+                        
+                        # Verify tokens from previous model (and generate next token)
                         draft_output_ids = get_sm_tensor(sm.chain_tensors[position - 1])
                         verify_inputs = build_verify_inputs(
                             draft_output_ids,
@@ -1018,33 +780,25 @@ class ChainSpeculativeDecoder:
                         )
                         verify_outputs = verify_step(model, **verify_inputs)
                         state = ChainState.from_step_output(verify_outputs)
-                        
-                        # Draft additional token if verification successful
-                        if verify_outputs["all_tokens_were_verified"] and verify_outputs["num_verified_tokens"] > 0:
-                            outputs = step(model, state.curr[:, -1:],
-                                         state.curr, state.past_key_values,
-                                         state.num_input_tokens)
-                            state = ChainState.from_step_output(outputs)
-                            
                         put_sm_tensor(state.curr, sm.chain_tensors[position])
                         
-                        # Request rollback from previous model if needed
+                        # Request rollback from previous model if verification failed
                         if not verify_outputs["all_tokens_were_verified"] or \
-                           verify_outputs["num_verified_tokens"] == 1:
+                            verify_outputs["num_verified_tokens"] == 1:
                             sm.rollback_requests[prev_pair] += 1
-                            
-                        # Signal rollback completion to next model
+                        
+                        # Signal rollback completion to next model if we handled their request
                         if sm.rollback_requests[next_pair] > sm.rollback_responses[next_pair] and handled_rollback:
                             sm.rollback_responses[next_pair] += 1
                             handled_rollback = False
-                            
+                        
                         # Log metrics
                         elapsed_time = time.time() - start_time
                         update_log(sm.execution_times[position],
-                                 sm.position_indices[position:position+1],
-                                 local_index, elapsed_time)
+                                  sm.position_indices[position:position+1],
+                                  local_index, elapsed_time)
                         sm.accepted_tokens[position-1, local_index] = verify_outputs["num_verified_tokens"]
-                        local_index += 1
+                        local_index += 1 
                 
                 else:  # Last model (pure verify)
                     prev_pair = position - 1
