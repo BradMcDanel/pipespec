@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from typing import Optional, Union, Dict, Any, List
 
 import torch.multiprocessing as mp
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, DynamicCache
+from transformers import BitsAndBytesConfig, DynamicCache
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
 def find_divergence_point(tensor1, tensor2):
@@ -26,7 +27,7 @@ def find_divergence_point(tensor1, tensor2):
     
     return divergence_index
 
-def step(model, input_ids, output_ids=None, past_key_values=None, num_input_tokens=-1):
+def step(model, input_ids, output_ids=None, past_key_values=None, num_input_tokens=-1, **kwargs):
     input_ids = input_ids.to(model.device)
 
     if past_key_values is None:
@@ -73,7 +74,7 @@ def build_verify_inputs(draft_output_ids, input_ids, output_ids, past_key_values
         "num_input_tokens": num_input_tokens
     }
 
-def build_draft_inputs(verify_output_ids, input_ids, output_ids, past_key_values, num_input_tokens):
+def build_draft_inputs(verify_output_ids, input_ids, output_ids, past_key_values, num_input_tokens, **kwargs):
     verify_ids = verify_output_ids.to(input_ids.device)
     divergence_index = find_divergence_point(output_ids[0], verify_ids[0])
 
@@ -140,6 +141,21 @@ def verify_step(model, input_ids, output_ids, past_key_values, num_input_tokens,
         "all_tokens_were_verified": num_verified_tokens == input_ids.size(1),
         "num_verified_tokens": num_verified_tokens
     }
+
+def put_sm_tensor(src_tensor, sm_tensor):
+    src_tensor = src_tensor.squeeze(0)
+    sm_tensor[0] = src_tensor.size(0)
+    sm_tensor[1:src_tensor.size(0)+1] = src_tensor
+
+def get_sm_tensor(sm_tensor):
+    return sm_tensor[1:sm_tensor[0].item()+1].unsqueeze(0)
+
+def update_log(times_tensor, index_tensor, idx, elapsed_time):
+    if idx >= times_tensor.size(0):
+        raise ValueError("Exceeded maximum log entries")
+    times_tensor[idx] = elapsed_time
+    idx += 1
+    index_tensor[0] = idx
 
 @dataclass
 class ModelConfig:
@@ -214,7 +230,6 @@ class ModelConfig:
 
 def init_model(model_config: ModelConfig):
     """Initialize model and tokenizer with the given configuration"""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
     
     model = AutoModelForCausalLM.from_pretrained(
         model_config.model_path,
@@ -290,287 +305,6 @@ class GreedyDecoder:
 
         return generated_ids
 
-class SyncSpeculativeDecoder:
-    def __init__(self, draft_config: ModelConfig, verify_config: ModelConfig, 
-                 draft_lookahead: int = 5,
-                 max_new_tokens: int = 4096):
-        self.draft_config = draft_config
-        self.verify_config = verify_config
-        self.draft_lookahead = draft_lookahead
-        self.max_new_tokens = max_new_tokens
-
-        self._init_models()
-
-    def _init_models(self):
-        self.draft_model, _ = init_model(self.draft_config)
-        self.verify_model, self.tokenizer = init_model(self.verify_config)
-
-    def generate(self, input_ids, return_metrics=False):
-        draft_state = step(self.draft_model, input_ids)
-        verify_state = step(self.verify_model, input_ids)
-
-        start_time = time.time()
-        metrics = {
-            "draft_times": [],
-            "verify_times": [],
-            "accepted_tokens": [],
-        }
-
-        while verify_state["output_ids"].size(1) < self.max_new_tokens:
-            # Draft step
-            while draft_state["output_ids"].size(1) < verify_state["output_ids"].size(1) + self.draft_lookahead:
-                draft_start_time = time.time()
-                draft_state = step(self.draft_model, **draft_state)
-                draft_time = time.time() - draft_start_time
-                metrics["draft_times"].append(draft_time)
-
-            # Verify step
-            verify_start_time = time.time()
-            num_old_verified_tokens = verify_state["output_ids"].size(1)
-            verify_state = build_verify_inputs(draft_state["output_ids"], **verify_state)
-            verify_state = verify_step(self.verify_model, **verify_state)
-            num_new_verified_tokens = verify_state["output_ids"].size(1) - num_old_verified_tokens
-            verify_time = time.time() - verify_start_time
-
-            # Update metrics
-            metrics["verify_times"].append(verify_time)
-            metrics["accepted_tokens"].append(num_new_verified_tokens)
-
-            # Check for EOS token
-            if self.tokenizer.eos_token_id in verify_state["output_ids"][0, -num_new_verified_tokens:]:
-                eos_index = (verify_state["output_ids"][0] == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0][-1].item()
-                verify_state["output_ids"] = verify_state["output_ids"][:, :eos_index+1]
-                break
-
-            # Update draft state
-            draft_state = build_draft_inputs(verify_state["output_ids"], **draft_state)
-
-        total_time = time.time() - start_time
-        tokens_generated = verify_state["output_ids"].size(1)
-        time_per_token = total_time / tokens_generated
-
-        metrics.update({
-            "total_time": total_time,
-            "tokens_generated": tokens_generated,
-            "time_per_token": time_per_token
-        })
-
-        if return_metrics:
-            return verify_state["output_ids"][0], metrics
-
-        return verify_state["output_ids"][0]
-
-@dataclass
-class ModelState:
-    """Tracks the state of each model in the chain"""
-    input_ids: torch.Tensor
-    output_ids: torch.Tensor
-    past_key_values: Optional[DynamicCache] = None
-    num_input_tokens: int = -1
-    
-    @property
-    def last_token(self):
-        return self.output_ids[:, -1:]
-    
-    @property
-    def num_tokens(self):
-        return self.output_ids.size(1)
-    
-    @classmethod
-    def from_dict(cls, d: dict) -> 'ModelState':
-        return cls(**d)
-
-class ThreeStageSpeculativeDecoder:
-    def __init__(self, small_config: ModelConfig, 
-                 medium_config: ModelConfig,
-                 large_config: ModelConfig,
-                 lookahead: int = 4,
-                 max_new_tokens: int = 4096):
-        self.lookahead = lookahead
-        self.max_new_tokens = max_new_tokens
-        
-        # Initialize models largest to smallest to share tokenizer
-        self.large_model, self.tokenizer = init_model(large_config)
-        self.medium_model, _ = init_model(medium_config)
-        self.small_model, _ = init_model(small_config)
-        
-    def _small_draft_step(self, state: ModelState) -> ModelState:
-        """Generate next token with small model"""
-        outputs = step(self.small_model, state.input_ids, state.output_ids,
-                      state.past_key_values, state.num_input_tokens)
-        return ModelState.from_dict(outputs)
-    
-    def _medium_verify_and_draft(self, state: ModelState, draft_ids: torch.Tensor) -> tuple[ModelState, int]:
-        """Verify small model tokens and generate medium model drafts"""
-        # First verify the draft tokens
-        verify_state_dict = build_verify_inputs(draft_ids, state.input_ids, 
-                                              state.output_ids, state.past_key_values,
-                                              state.num_input_tokens)
-        verify_state = ModelState.from_dict(verify_state_dict)
-        
-        num_draft_tokens = verify_state.input_ids.size(1)
-        old_verified_len = verify_state.output_ids.size(1)
-        
-        verify_outputs = verify_step(self.medium_model, 
-                                   verify_state.input_ids,
-                                   verify_state.output_ids,
-                                   verify_state.past_key_values,
-                                   verify_state.num_input_tokens)
-        verify_state = ModelState.from_dict(verify_outputs)
-        
-        num_accepted = verify_state.output_ids.size(1) - old_verified_len
-        
-        # Draft additional tokens if we verified successfully
-        if num_accepted > 0:
-            outputs = step(self.medium_model, 
-                         verify_state.input_ids,
-                         verify_state.output_ids,
-                         verify_state.past_key_values,
-                         verify_state.num_input_tokens)
-            verify_state = ModelState.from_dict(outputs)
-            
-        return verify_state, num_accepted
-        
-    def _large_verify(self, state: ModelState, draft_ids: torch.Tensor) -> tuple[ModelState, int]:
-        """Verify tokens from medium model"""
-        verify_state_dict = build_verify_inputs(draft_ids, state.input_ids,
-                                              state.output_ids, state.past_key_values,
-                                              state.num_input_tokens)
-        verify_state = ModelState.from_dict(verify_state_dict)
-        
-        old_verified_len = verify_state.output_ids.size(1)
-        
-        verify_outputs = verify_step(self.large_model, 
-                                   verify_state.input_ids,
-                                   verify_state.output_ids,
-                                   verify_state.past_key_values,
-                                   verify_state.num_input_tokens)
-        verify_state = ModelState.from_dict(verify_outputs)
-        
-        return verify_state, verify_state.output_ids.size(1) - old_verified_len
-
-    def generate(self, input_ids: torch.Tensor, return_metrics: bool = False):
-        # Initialize states
-        small_state = ModelState.from_dict(step(self.small_model, input_ids))
-        medium_state = ModelState.from_dict(step(self.medium_model, input_ids))
-        large_state = ModelState.from_dict(step(self.large_model, input_ids))
-        
-        start_time = time.time()
-        metrics = {
-            "small_times": [],
-            "medium_times": [],
-            "large_times": [],
-            "medium_accepted_tokens": [],
-            "large_accepted_tokens": []
-        }
-        
-        while large_state.num_tokens < self.max_new_tokens:
-            # Small model generates lookahead tokens
-            small_start = time.time()
-            while small_state.num_tokens < medium_state.num_tokens + self.lookahead:
-                small_state = self._small_draft_step(small_state)
-            metrics["small_times"].append(time.time() - small_start)
-            
-            # Medium model verifies and drafts
-            medium_start = time.time()
-            medium_state, num_medium_accepted = self._medium_verify_and_draft(
-                medium_state, small_state.output_ids
-            )
-            metrics["medium_times"].append(time.time() - medium_start)
-            metrics["medium_accepted_tokens"].append(num_medium_accepted)
-            
-            # If medium didn't accept enough tokens, generate more from small
-            while num_medium_accepted < self.lookahead:
-                small_start = time.time()
-                small_state = self._small_draft_step(small_state)
-                metrics["small_times"].append(time.time() - small_start)
-                
-                medium_start = time.time()
-                medium_state, additional_accepted = self._medium_verify_and_draft(
-                    medium_state, small_state.output_ids
-                )
-                metrics["medium_times"].append(time.time() - medium_start)
-                metrics["medium_accepted_tokens"].append(additional_accepted)
-                num_medium_accepted += additional_accepted
-            
-            # Large model verifies medium's tokens
-            large_start = time.time()
-            large_state, num_large_accepted = self._large_verify(
-                large_state, medium_state.output_ids
-            )
-            metrics["large_times"].append(time.time() - large_start)
-            metrics["large_accepted_tokens"].append(num_large_accepted)
-            
-            # Check for EOS token in newly verified tokens
-            if self.tokenizer.eos_token_id in large_state.output_ids[0, -num_large_accepted:]:
-                eos_idx = (large_state.output_ids[0] == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0][-1].item()
-                large_state.output_ids = large_state.output_ids[:, :eos_idx + 1]
-                break
-            
-            # Update small and medium states based on verifications
-            if num_large_accepted < num_medium_accepted:
-                # Reset medium state to match large's verified tokens
-                medium_state_dict = build_draft_inputs(
-                    large_state.output_ids, 
-                    medium_state.input_ids,
-                    medium_state.output_ids,
-                    medium_state.past_key_values,
-                    medium_state.num_input_tokens
-                )
-                medium_state = ModelState.from_dict(medium_state_dict)
-                
-                # Reset small state to match medium's verified tokens
-                small_state_dict = build_draft_inputs(
-                    medium_state.output_ids,
-                    small_state.input_ids,
-                    small_state.output_ids,
-                    small_state.past_key_values,
-                    small_state.num_input_tokens
-                )
-                small_state = ModelState.from_dict(small_state_dict)
-        
-        total_time = time.time() - start_time
-        tokens_generated = large_state.output_ids.size(1)
-        
-        metrics.update({
-            "total_time": total_time,
-            "tokens_generated": tokens_generated,
-            "time_per_token": total_time / tokens_generated
-        })
-        
-        if return_metrics:
-            return large_state.output_ids[0], metrics
-            
-        return large_state.output_ids[0]
-
-@dataclass
-class SharedMemory:
-    input_tensor: torch.Tensor
-    draft_tensor: torch.Tensor
-    verify_tensor: torch.Tensor
-    rollback_requests: torch.Tensor
-    rollback_responses: torch.Tensor
-    draft_times: torch.Tensor
-    verify_times: torch.Tensor
-    accepted_tokens: torch.Tensor
-    draft_index: torch.Tensor
-    verify_index: torch.Tensor
-
-def put_sm_tensor(src_tensor, sm_tensor):
-    src_tensor = src_tensor.squeeze(0)
-    sm_tensor[0] = src_tensor.size(0)
-    sm_tensor[1:src_tensor.size(0)+1] = src_tensor
-
-def get_sm_tensor(sm_tensor):
-    return sm_tensor[1:sm_tensor[0].item()+1].unsqueeze(0)
-
-def update_log(times_tensor, index_tensor, idx, elapsed_time):
-    if idx >= times_tensor.size(0):
-        raise ValueError("Exceeded maximum log entries")
-    times_tensor[idx] = elapsed_time
-    idx += 1
-    index_tensor[0] = idx
-
 @dataclass
 class ChainState:
     """Represents state for a single model in the chain"""
@@ -634,6 +368,132 @@ class ChainEvents:
         self.reset[position].clear()
 
 class ChainSpeculativeDecoder:
+    def __init__(self, model_configs: List[ModelConfig], 
+                 draft_lookahead: int = 5,
+                 max_new_tokens: int = 4096):
+        if len(model_configs) < 2:
+            raise ValueError("Need at least 2 models in chain")
+            
+        self.model_configs = model_configs
+        self.draft_lookahead = draft_lookahead
+        self.max_new_tokens = max_new_tokens
+        self.num_positions = len(model_configs)
+        
+        self._init_models()
+        
+    def _init_models(self):
+        self.models = []
+        self.tokenizer = None
+        
+        for config in self.model_configs:
+            model, tokenizer = init_model(config)
+            self.models.append(model)
+            if self.tokenizer is None:
+                self.tokenizer = tokenizer
+    
+    def _update_chain(self, states, start_idx, verified_output_ids):
+        """Update all models in chain from start_idx based on verified output"""
+        for i in range(start_idx, -1, -1):
+            states[i] = build_draft_inputs(verified_output_ids, **states[i])
+        return states
+                
+    def generate(self, input_ids, return_metrics=False):
+        metrics = {
+            "model_times": [[] for _ in range(self.num_positions)],
+            "accepted_tokens": [[] for _ in range(self.num_positions - 1)],
+            "total_time": 0,
+            "tokens_generated": 0
+        } if return_metrics else None
+        
+        start_time = time.time()
+        
+        # Initialize states
+        states = []
+        for i, model in enumerate(self.models):
+            outputs = step(model, input_ids)
+            states.append({
+                "input_ids": outputs["input_ids"],
+                "output_ids": outputs["output_ids"],
+                "past_key_values": outputs["past_key_values"],
+                "num_input_tokens": outputs["num_input_tokens"]
+            })
+        
+        while states[-1]["output_ids"].size(1) < self.max_new_tokens:
+            # Draft phase for first model
+            draft_token_start = time.time()
+            while (states[0]["output_ids"].size(1) < 
+                   states[-1]["output_ids"].size(1) + self.draft_lookahead):
+                states[0] = step(self.models[0], **states[0])
+                if return_metrics:
+                    metrics["model_times"][0].append(time.time() - draft_token_start)
+                    draft_token_start = time.time()
+            
+            # Verify and draft through middle models
+            needs_chain_update = False
+            for i in range(1, self.num_positions - 1):
+                verify_start = time.time()
+                prev_output_len = states[i]["output_ids"].size(1)
+                
+                # Verify tokens from previous model
+                states[i] = build_verify_inputs(states[i-1]["output_ids"], **states[i])
+                states[i] = verify_step(self.models[i], **states[i])
+                num_verified = states[i]["output_ids"].size(1) - prev_output_len
+                
+                if return_metrics:
+                    verify_time = time.time() - verify_start
+                    metrics["model_times"][i].append(verify_time)
+                    metrics["accepted_tokens"][i-1].append(num_verified)
+                
+                # Check if verification failed or minimal progress
+                if not states[i]["all_tokens_were_verified"] or num_verified <= 1:
+                    # Update all previous models in chain
+                    states = self._update_chain(states, i-1, states[i]["output_ids"])
+                    needs_chain_update = True
+                    
+                    # Generate new draft tokens
+                    draft_start = time.time()
+                    while (states[i]["output_ids"].size(1) < 
+                           states[-1]["output_ids"].size(1) + self.draft_lookahead):
+                        states[i] = step(self.models[i], **states[i])
+                        if return_metrics:
+                            metrics["model_times"][i].append(time.time() - draft_start)
+                            draft_start = time.time()
+            
+            # Final verification
+            verify_start = time.time()
+            prev_output_len = states[-1]["output_ids"].size(1)
+            states[-1] = build_verify_inputs(states[-2]["output_ids"], **states[-1])
+            states[-1] = verify_step(self.models[-1], **states[-1])
+            num_verified = states[-1]["output_ids"].size(1) - prev_output_len
+            
+            if return_metrics:
+                verify_time = time.time() - verify_start
+                metrics["model_times"][-1].append(verify_time)
+                metrics["accepted_tokens"][-1].append(num_verified)
+            
+            # If final verification failed or minimal progress
+            if not states[-1]["all_tokens_were_verified"] or num_verified <= 1:
+                states = self._update_chain(states, self.num_positions-2, states[-1]["output_ids"])
+            
+            # Check for EOS
+            if self.tokenizer.eos_token_id in states[-1]["output_ids"][0, -num_verified:]:
+                eos_index = (states[-1]["output_ids"][0] == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0][-1].item()
+                states[-1]["output_ids"] = states[-1]["output_ids"][:, :eos_index+1]
+                break
+        
+        if return_metrics:
+            total_time = time.time() - start_time
+            tokens_generated = states[-1]["output_ids"].size(1)
+            metrics.update({
+                "total_time": total_time,
+                "tokens_generated": tokens_generated,
+                "time_per_token": total_time / tokens_generated
+            })
+            return states[-1]["output_ids"][0], metrics
+            
+        return states[-1]["output_ids"][0]
+
+class AsyncChainSpeculativeDecoder:
     """N-model chain-based speculative decoder"""
     def __init__(self, model_configs: List[ModelConfig],
                  max_new_tokens: int = 4096, max_length: int = 8096,

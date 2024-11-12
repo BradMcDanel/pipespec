@@ -15,7 +15,7 @@ MAX_NEW_TOKENS = 4096
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--strategy", type=str, default="three-model", 
-                      choices=["greedy", "sd", "amusd", "three-model", "amusd-three", "chain"],
+                      choices=["greedy", "chain", "async-chain"],
                       help="Decoding strategy (three-model=sync, amusd-three=async)")
     parser.add_argument("--dataset", type=str, required=True,
                       help="Path or name of the dataset to use")
@@ -52,37 +52,14 @@ if __name__ == "__main__":
     # Initialize decoder based on strategy
     if args.strategy == 'greedy':
         decoder = decoding.GreedyDecoder(model_configs[-1], max_new_tokens=MAX_NEW_TOKENS)
-    elif args.strategy == 'sd':
-        if len(model_configs) < 2:
-            raise ValueError("sd strategy requires at least 2 models")
-        decoder = decoding.SyncSpeculativeDecoder(
-            model_configs[0], 
-            model_configs[-1], 
-            max_new_tokens=MAX_NEW_TOKENS
-        )
-    elif args.strategy == 'three-model':
-        if len(model_configs) < 3:
-            raise ValueError("three-model strategy requires at least 3 models")
-        decoder = decoding.ThreeStageSpeculativeDecoder(
-            model_configs[0],  # small
-            model_configs[1],  # medium
-            model_configs[2],  # large
-            lookahead=args.lookahead,
-            max_new_tokens=MAX_NEW_TOKENS
-        )
     elif args.strategy == 'chain':
         if len(model_configs) < 2:
             raise ValueError("chain strategy requires at least 2 models")
         decoder = decoding.ChainSpeculativeDecoder(model_configs, max_new_tokens=MAX_NEW_TOKENS)
-    elif args.strategy == 'amusd-three':
-        if len(model_configs) < 3:
-            raise ValueError("amusd-three strategy requires at least 3 models")
-        decoder = decoding.ThreeStageAsyncSpeculativeDecoder(
-            model_configs[0],  # small
-            model_configs[1],  # medium
-            model_configs[2],  # large
-            max_new_tokens=MAX_NEW_TOKENS
-        )
+    elif args.strategy == 'async-chain':
+        if len(model_configs) < 2:
+            raise ValueError("async-chain strategy requires at least 2 models")
+        decoder = decoding.AsyncChainSpeculativeDecoder(model_configs, max_new_tokens=MAX_NEW_TOKENS)
 
     # Load tokenizer from the largest model
     tok = AutoTokenizer.from_pretrained(model_configs[-1].model_path)
@@ -111,7 +88,7 @@ if __name__ == "__main__":
     
     print(tok.decode(output_ids, skip_special_tokens=True))
     print(metrics["time_per_token"])
-    # print(metrics)
+    print(metrics)
 
     if hasattr(decoder, 'close'):
         decoder.close()
