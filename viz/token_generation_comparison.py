@@ -2,179 +2,152 @@ import json
 import matplotlib.pyplot as plt
 import numpy as np
 import os
+import argparse
+from typing import Dict, List, Tuple
+import sys
 
-# Load the JSON data
-with open('results/refactorchat_sample.json', 'r') as f:
-    data = json.load(f)
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from viz.utils import (
+    set_plotting_style, 
+    get_figure_axes, 
+    style_axis, 
+    add_legend,
+    COLORS, 
+    MODEL_CONFIGS
+)
 
-# Extract data for each approach
-greedy_data = next(item for item in data if item['strategy'] == 'greedy')
-sd_data = next(item for item in data if item['strategy'] == 'sd')
-amusd_data = next(item for item in data if item['strategy'] == 'amusd')
 
-# Get the total number of tokens from the greedy strategy
-total_tokens = len(greedy_data['metrics'].get('token_times', []))
-
-# Prepare cumulative data
-def get_cumulative_tokens_times(strategy_data, strategy_name, total_tokens):
+def get_cumulative_tokens_times(metrics: Dict, is_greedy: bool) -> Tuple[List[float], List[int]]:
+    """Calculate cumulative tokens and times for a single sample"""
     cumulative_times = []
     tokens = []
     
-    if strategy_name == 'greedy':
-        token_times = strategy_data['metrics'].get('token_times', [])
+    if is_greedy:
+        if 'token_times' not in metrics:
+            return [], []
+            
+        times = metrics['token_times']
         cumulative_time = 0
-        for i, time in enumerate(token_times):
+        for i, time in enumerate(times):
             cumulative_time += time
             cumulative_times.append(cumulative_time)
             tokens.append(i + 1)
-        return cumulative_times, tokens
-    
-    elif strategy_name == 'sd':
-        draft_times = strategy_data['metrics'].get('draft_times', [])
-        verify_times = strategy_data['metrics'].get('verify_times', [])
-        cumulative_time = 0
+    else:
+        if 'model_times' not in metrics:
+            return [], []
+            
+        times = metrics['model_times'][-1]
         tokens_emitted = 0
-        cumulative_times = []
-        tokens = []
+        cumulative_time = 0
         
-        # Assume equal batch sizes
-        num_verifications = len(verify_times)
-        batch_size = total_tokens // num_verifications
-        extra_tokens = total_tokens % num_verifications
-        batch_sizes = [batch_size + (1 if i < extra_tokens else 0) for i in range(num_verifications)]
+        accepted_tokens = metrics.get('accepted_tokens', [])[-1] if metrics.get('accepted_tokens') else [1] * len(times)
         
-        idx = 0  # Index for draft times
-        for i in range(len(verify_times)):
-            # Add draft times for the batch
-            batch_draft_times = draft_times[idx:idx+batch_sizes[i]]
-            cumulative_time += sum(batch_draft_times)
-            idx += batch_sizes[i]
-            # Add verification time
-            cumulative_time += verify_times[i]
-            tokens_emitted += batch_sizes[i]
+        for i, (time, accepted) in enumerate(zip(times, accepted_tokens)):
+            cumulative_time += time
+            tokens_emitted += accepted
             cumulative_times.append(cumulative_time)
             tokens.append(tokens_emitted)
-        return cumulative_times, tokens
     
-    elif strategy_name == 'amusd':
-        verify_times = strategy_data['metrics'].get('verify_times', [])
-        cumulative_time = 0
-        tokens_emitted = 0
-        cumulative_times = []
-        tokens = []
-        
-        num_verifications = len(verify_times)
-        batch_size = total_tokens // num_verifications
-        extra_tokens = total_tokens % num_verifications
-        batch_sizes = [batch_size + (1 if i < extra_tokens else 0) for i in range(num_verifications)]
-        
-        for i in range(len(verify_times)):
-            cumulative_time += verify_times[i]
-            tokens_emitted += batch_sizes[i]
-            cumulative_times.append(cumulative_time)
-            tokens.append(tokens_emitted)
-        return cumulative_times, tokens
+    return cumulative_times, tokens
 
-# Get cumulative data for each strategy
-greedy_times, greedy_tokens = get_cumulative_tokens_times(greedy_data, 'greedy', total_tokens)
-sd_times, sd_tokens = get_cumulative_tokens_times(sd_data, 'sd', total_tokens)
-amusd_times, amusd_tokens = get_cumulative_tokens_times(amusd_data, 'amusd', total_tokens)
-
-# Update total_tokens to be the maximum tokens emitted among all strategies
-max_tokens = max(greedy_tokens[-1], sd_tokens[-1], amusd_tokens[-1])
-
-# Custom "old-school" styling with new colors
-plt.rcParams.update({
-    'axes.facecolor': 'white',
-    'axes.edgecolor': 'black',
-    'axes.grid': True,
-    'grid.color': 'gray',
-    'grid.linestyle': '--',
-    'grid.linewidth': 0.5,
-    'axes.titleweight': 'bold',
-    'axes.labelsize': 12,
-    'axes.labelweight': 'bold',
-    'font.size': 12,
-    'figure.figsize': [8, 4],
-    'lines.linewidth': 2,
-    'axes.prop_cycle': plt.cycler('color', ['#4682B4', '#32CD32', '#FF8C00']),  # Steel blue, lime green, dark orange
-    'xtick.direction': 'out',
-    'ytick.direction': 'out',
-    'xtick.major.size': 6,
-    'ytick.major.size': 6,
-    'xtick.color': 'black',
-    'ytick.color': 'black',
-    'savefig.dpi': 400,
-})
-
-# Plot cumulative tokens over time using step plots
-fig, ax = plt.subplots(figsize=(8, 4))
-
-# Main lines
-ax.step(greedy_times, greedy_tokens, where='post', linewidth=2, color='#4682B4')
-ax.step(sd_times, sd_tokens, where='post', linewidth=2, color='#32CD32')
-ax.step(amusd_times, amusd_tokens, where='post', linewidth=2, color='#FF8C00')
-
-# Adding direct labels to each line with rotation
-strategies = [
-    {'times': greedy_times, 'tokens': greedy_tokens, 'label': 'Autoregressive', 'color': '#4682B4'},
-    {'times': sd_times, 'tokens': sd_tokens, 'label': 'Speculative Decoding', 'color': '#32CD32'},
-    {'times': amusd_times, 'tokens': amusd_tokens, 'label': 'AMUSD (ours)', 'color': '#FF8C00'},
-]
-
-# Adjust y-offsets and positions for labels
-strategy_text_offsets = {
-    "Autoregressive": (12.5, 580, 24),
-    "Speculative Decoding": (7, 420, 28.5),
-    "AMUSD (ours)": (3, 205, 37.5),
-}
-
-for strat in strategies:
-    times = strat['times']
-    tokens = strat['tokens']
-    label = strat['label']
-    color = strat['color']
-
-    x, y, rotation = strategy_text_offsets[label]
+def aggregate_samples(samples: List[Dict], is_greedy: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Aggregate data across all samples and compute statistics"""
+    all_times = []
+    all_tokens = []
     
-    # Place the label slightly offset from the line
-    ax.text(
-        x, y, label,
-        fontsize=10, fontweight='bold', color=color,
-        rotation=rotation, rotation_mode='anchor',
-        ha='left', va='bottom',
-        backgroundcolor='white',
-        bbox=dict(facecolor='white', edgecolor='none', pad=0.2, alpha=0.7)
+    for sample in samples:
+        times, tokens = get_cumulative_tokens_times(sample['metrics'], is_greedy)
+        if times and tokens:
+            all_times.append(times)
+            all_tokens.append(tokens)
+    
+    if not all_times:
+        return np.array([]), np.array([]), np.array([]), np.array([])
+    
+    min_tokens = min(max(tokens) for tokens in all_tokens)
+    token_positions = np.arange(1, min_tokens + 1)
+    
+    aligned_times = []
+    for times, tokens in zip(all_times, all_tokens):
+        times = np.array(times)
+        tokens = np.array(tokens)
+        
+        mask = tokens <= min_tokens
+        if not any(mask):
+            continue
+            
+        times = times[mask]
+        tokens = tokens[mask]
+        
+        interpolated_times = np.interp(token_positions, tokens, times)
+        aligned_times.append(interpolated_times)
+    
+    aligned_times = np.array(aligned_times)
+    
+    mean_times = np.mean(aligned_times, axis=0)
+    std_times = np.std(aligned_times, axis=0)
+    
+    return token_positions, mean_times, mean_times - std_times, mean_times + std_times
+
+def plot_token_generation(folder_path: str):
+    """Create token generation plot with averaged samples"""
+    set_plotting_style()
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    for filename, label in MODEL_CONFIGS.items():
+        file_path = os.path.join(folder_path, filename)
+        if not os.path.exists(file_path):
+            print(f"Skipping {filename} - file not found")
+            continue
+            
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+        
+        if not data.get("results"):
+            continue
+        
+        is_greedy = 'greedy' in filename
+        print(f"Processing {label} with {len(data['results'])} samples")
+        
+        tokens, mean_times, lower_times, upper_times = aggregate_samples(data["results"], is_greedy)
+        if len(tokens) > 0:
+            color = COLORS[label]
+            ax.plot(mean_times, tokens, color=color, label=label, linewidth=1.5)
+            ax.fill_betweenx(tokens, lower_times, upper_times, color=color, alpha=0.1)
+
+    style_axis(ax,
+              xlabel='Time (seconds)',
+              ylabel='Number of Verified Tokens',
+              title='Token Generation Comparison')
+    
+    # Move legend inside the plot area
+    legend = ax.legend(
+        loc='center right',    # Position on right side inside plot
+        bbox_to_anchor=(0.98, 0.5),  # Fine-tune position
+        ncol=1,               # Single column for better readability
+        frameon=True,         # Keep the frame
+        framealpha=0.9,       # Slightly transparent background
+        edgecolor='lightgray',# Subtle edge
+        handlelength=1.5,     # Keep shorter lines
+        borderpad=0.5,        # Padding inside the box
     )
+    
+    # Set legend background color to white with some transparency
+    legend.get_frame().set_facecolor('white')
+    
+    plt.tight_layout()
+    
+    os.makedirs('figures', exist_ok=True)
+    output_path = os.path.join('figures', f'token-generation-comparison.pdf')
+    plt.savefig(output_path, bbox_inches='tight', pad_inches=0.1)
+    plt.close()
 
-# Labels and title
-ax.set_xlabel('Time (seconds)', fontweight='bold')
-ax.set_ylabel('# of Verified Tokens', fontweight='bold')
-ax.set_title('Verified Tokens Generated Over Time by Strategy', fontweight='bold')
+def main():
+    parser = argparse.ArgumentParser(description="Generate token generation plots for benchmark results.")
+    parser.add_argument("folder", help="Path to the folder containing results")
+    args = parser.parse_args()
+    
+    plot_token_generation(args.folder)
 
-# Grid
-ax.grid(True, linestyle='--', linewidth=0.5, color='gray')
-
-# Set plot limits based on data
-ax.set_xlim(left=0)
-ax.set_ylim(bottom=0)
-
-# Ensure labels are within plot area
-plt.tight_layout()
-# plt.subplots_adjust(right=0.95)  # Adjust if labels are cut off
-
-# Save the plot
-os.makedirs('figures', exist_ok=True)
-plt.savefig('figures/token-generation-comparison.pdf', dpi=400, bbox_inches='tight')
-plt.show()
-
-
-def get_average_accepted(strategy_data):
-    accepted_tokens = strategy_data['metrics'].get('accepted_tokens', [])
-    if accepted_tokens:
-        return sum(accepted_tokens) / len(accepted_tokens)
-    return 0
-
-print("\nAverage accepted tokens per batch:")
-print(f"Speculative Decoding: {get_average_accepted(sd_data):.2f}")
-print(f"AMUSD: {get_average_accepted(amusd_data):.2f}")
+if __name__ == "__main__":
+    main()
