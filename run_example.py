@@ -55,11 +55,13 @@ if __name__ == "__main__":
     elif args.strategy == 'chain':
         if len(model_configs) < 2:
             raise ValueError("chain strategy requires at least 2 models")
-        decoder = decoding.ChainSpeculativeDecoder(model_configs, max_new_tokens=MAX_NEW_TOKENS)
+        decoder = decoding.ChainSpeculativeDecoder(model_configs, draft_lookahead=args.lookahead,
+                                                   max_new_tokens=MAX_NEW_TOKENS)
     elif args.strategy == 'async-chain':
         if len(model_configs) < 2:
             raise ValueError("async-chain strategy requires at least 2 models")
-        decoder = decoding.AsyncChainSpeculativeDecoder(model_configs, max_new_tokens=MAX_NEW_TOKENS)
+        decoder = decoding.AsyncChainSpeculativeDecoder(model_configs, draft_lookahead=args.lookahead,
+                                                        max_new_tokens=MAX_NEW_TOKENS)
 
     # Load tokenizer from the largest model
     tok = AutoTokenizer.from_pretrained(model_configs[-1].model_path)

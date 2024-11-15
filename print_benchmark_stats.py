@@ -1,193 +1,146 @@
 import json
 import argparse
-from collections import defaultdict
-import statistics
 import os
 from typing import List, Dict, Any
-import numpy as np
 
-def calculate_verification_stats(accepted_tokens: List[List[int]]) -> Dict[str, float]:
-    """Calculate verification statistics from accepted tokens arrays"""
-    stats = {}
-    
-    if not accepted_tokens:
-        return stats
-        
-    # Flatten accepted tokens if needed
-    all_tokens = [t for sublist in accepted_tokens for t in sublist]
-    
-    if all_tokens:
-        stats["mean_tokens_accepted"] = statistics.mean(all_tokens)
-        stats["median_tokens_accepted"] = statistics.median(all_tokens)
-        stats["min_tokens_accepted"] = min(all_tokens)
-        stats["max_tokens_accepted"] = max(all_tokens)
-        stats["stdev_tokens_accepted"] = statistics.stdev(all_tokens) if len(all_tokens) > 1 else 0
-        
-        # Calculate acceptance rate distribution
-        total_tokens = len(all_tokens)
-        single_token_accepts = sum(1 for t in all_tokens if t == 1)
-        stats["single_token_acceptance_rate"] = single_token_accepts / total_tokens
-        stats["multi_token_acceptance_rate"] = 1 - stats["single_token_acceptance_rate"]
-        
-    return stats
+def extract_model_sizes(model_str: str) -> List[str]:
+    """Extract model sizes from a model string"""
+    models = []
+    for part in model_str.split('-'):
+        if part.endswith('B'):
+            models.append(part)
+    return models
 
-def analyze_gpu_stats(gpustats: List[Dict[str, Any]]) -> Dict[str, float]:
-    """Analyze GPU utilization and memory usage"""
-    stats = {}
-    
-    if not gpustats:
-        return stats
-        
-    # Extract statistics for each GPU
-    gpu_utils = defaultdict(list)
-    gpu_mems = defaultdict(list)
-    gpu_powers = defaultdict(list)
-    
-    for stat in gpustats:
-        for i, (util, mem, power) in enumerate(zip(
-            stat['gpu_utilizations'],
-            stat['gpu_memories'],
-            stat['gpu_powers']
-        )):
-            gpu_utils[i].append(util)
-            gpu_mems[i].append(mem)
-            gpu_powers[i].append(power)
-    
-    # Calculate statistics for each GPU
-    for gpu_id in gpu_utils.keys():
-        prefix = f"gpu{gpu_id}_"
-        stats[prefix + "util_mean"] = statistics.mean(gpu_utils[gpu_id])
-        stats[prefix + "util_peak"] = max(gpu_utils[gpu_id])
-        stats[prefix + "mem_mean"] = statistics.mean(gpu_mems[gpu_id])
-        stats[prefix + "mem_peak"] = max(gpu_mems[gpu_id])
-        stats[prefix + "power_mean"] = statistics.mean(gpu_powers[gpu_id])
-        stats[prefix + "power_peak"] = max(gpu_powers[gpu_id])
-    
-    return stats
+def get_model_size_value(size_str: str) -> int:
+    """Convert model size string to numeric value (e.g., '70B' -> 70)"""
+    return int(size_str.rstrip('B'))
 
-def analyze_model_times(metrics: Dict[str, Any]) -> Dict[str, float]:
-    """Analyze model execution times"""
-    stats = {}
+def find_largest_model_size(file_paths: List[str]) -> str:
+    """Find the largest model size from a list of file paths"""
+    max_size = 0
+    max_size_str = None
     
-    if 'model_times' not in metrics:
-        return stats
-        
-    model_times = metrics['model_times']
-    for i, times in enumerate(model_times):
-        if times:
-            prefix = f"model{i}_"
-            stats[prefix + "mean_time"] = statistics.mean(times)
-            stats[prefix + "median_time"] = statistics.median(times)
-            stats[prefix + "min_time"] = min(times)
-            stats[prefix + "max_time"] = max(times)
-            stats[prefix + "stdev_time"] = statistics.stdev(times) if len(times) > 1 else 0
-            
-    return stats
+    for path in file_paths:
+        filename = os.path.basename(path)
+        model_str = filename.split('_')[1].replace('.json', '')
+        sizes = extract_model_sizes(model_str)
+        if sizes:
+            size_value = get_model_size_value(sizes[-1])  # Get the last (largest) model size
+            if size_value > max_size:
+                max_size = size_value
+                max_size_str = sizes[-1]
+    
+    return max_size_str
 
-def analyze_results(file_paths: List[str]):
-    """Analyze results from multiple benchmark files"""
-    all_results = {}
-    reference_time = None
+def analyze_dataset_results(folder_path: str):
+    """Analyze results for a single dataset folder"""
+    # Get all JSON files in the folder
+    file_paths = [os.path.join(folder_path, f) for f in os.listdir(folder_path) 
+                 if f.endswith('.json')]
     
+    # Find the largest model size in this dataset
+    largest_model = find_largest_model_size(file_paths)
+    if not largest_model:
+        print(f"Error: Could not determine largest model size in {folder_path}")
+        return
+    
+    # Find baseline (largest model with greedy decoding)
+    baseline_time = None
     for file_path in file_paths:
+        filename = os.path.basename(file_path)
+        if filename.startswith('greedy_') and largest_model in filename:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+                
+            total_time = 0
+            total_tokens = 0
+            for sample in data["results"]:
+                metrics = sample["metrics"]
+                total_time += metrics['total_time']
+                total_tokens += metrics['tokens_generated']
+            
+            baseline_time = (total_time / total_tokens) * 1000
+            break
+    
+    # Collect all results for largest model
+    results = []
+    for file_path in file_paths:
+        filename = os.path.basename(file_path)
+        if not largest_model in filename:
+            continue
+            
+        strategy = filename.split('_')[0]
+        model_str = filename.split('_')[1].replace('.json', '')
+        model_sizes = extract_model_sizes(model_str)
+        
         with open(file_path, 'r') as f:
             data = json.load(f)
-        
-        # Extract metadata and results
-        metadata = data["metadata"]
-        results = data["results"]
-        strategy = metadata["strategy"]
-        
-        # Initialize storage for this strategy
-        strategy_stats = {
-            "metadata": metadata,
-            "aggregate_metrics": defaultdict(list),
-            "verification_stats": [],
-            "gpu_stats": [],
-            "model_timing_stats": [],
-            "samples_processed": len(results)
-        }
-        
-        # Process each sample
-        for sample in results:
+            
+        # Calculate average time per token
+        total_time = 0
+        total_tokens = 0
+        for sample in data["results"]:
             metrics = sample["metrics"]
-            
-            # Store basic metrics
-            for key, value in metrics.items():
-                if isinstance(value, (int, float)):
-                    strategy_stats["aggregate_metrics"][key].append(value)
-            
-            # Calculate verification statistics if available
-            if "accepted_tokens" in metrics:
-                strategy_stats["verification_stats"].append(
-                    calculate_verification_stats(metrics["accepted_tokens"])
-                )
-            
-            # Calculate GPU statistics
-            if "gpustats" in sample:
-                strategy_stats["gpu_stats"].append(
-                    analyze_gpu_stats(sample["gpustats"])
-                )
-            
-            # Calculate model timing statistics
-            strategy_stats["model_timing_stats"].append(
-                analyze_model_times(metrics)
-            )
+            total_time += metrics['total_time']
+            total_tokens += metrics['tokens_generated']
         
-        # Calculate final statistics
-        metrics = strategy_stats["aggregate_metrics"]
-        if 'total_time' in metrics and 'tokens_generated' in metrics:
-            total_time = sum(metrics['total_time'])
-            total_tokens = sum(metrics['tokens_generated'])
-            avg_time_per_token = (total_time / total_tokens) * 1000 if total_tokens > 0 else 0
-            strategy_stats["time_per_token"] = avg_time_per_token
-            
-            if strategy == 'greedy':
-                reference_time = avg_time_per_token
+        avg_time = (total_time / total_tokens) * 1000  # convert to ms
         
-        all_results[strategy] = strategy_stats
+        # Format the configuration name with new naming convention
+        if 'async-chain' in strategy:
+            method = 'PipeSpec'
+        elif 'chain' in strategy:
+            method = 'Speculative'
+        elif 'greedy' in strategy:
+            method = 'Autoregressive'
+            
+        results.append({
+            'method': method,
+            'time': avg_time,
+            'base_model': model_sizes[-1],
+            'helper_models': model_sizes[:-1] if len(model_sizes) > 1 else [],
+            'full_path': file_path
+        })
     
-    # Print analysis
-    print("\nBenchmark Analysis Results")
-    print("=========================\n")
+    # Print results
+    dataset_name = os.path.basename(folder_path)
+    print(f"\nResults for dataset: {dataset_name}")
+    print("=" * 80)
     
-    for strategy, stats in all_results.items():
-        print(f"\nStrategy: {strategy}")
-        print("=" * (len(strategy) + 10))
-        print(f"Models used: {', '.join(cfg['path'] for cfg in stats['metadata']['model_configs'])}")
-        print(f"Number of samples: {stats['samples_processed']}")
-        print(f"Lookahead: {stats['metadata']['lookahead']}")
-        print("\nPerformance Metrics:")
-        print("-" * 20)
-        
-        # Print time per token and speedup
-        print(f"Average time per token: {stats['time_per_token']:.3f} ms")
-        if reference_time and strategy != 'greedy':
-            speedup = reference_time / stats['time_per_token']
-            print(f"Speedup vs greedy: {speedup:.2f}x")
-        
-        # Print verification statistics if available
-        if stats['verification_stats']:
-            print("\nVerification Statistics:")
-            print("-" * 20)
-            for metric, value in stats['verification_stats'][0].items():
-                print(f"{metric}: {value:.3f}")
-        
-        # Print GPU utilization
-        if stats['gpu_stats']:
-            print("\nGPU Statistics:")
-            print("-" * 20)
-            for metric, value in stats['gpu_stats'][0].items():
-                print(f"{metric}: {value:.2f}")
-        
-        print("\n" + "=" * 50 + "\n")
+    # Print header
+    if baseline_time:
+        print(f"{'Base Model':<12} {'Method':<15} {'Helper Models':<20} {'Mean Token Time':<20} {'Speedup':<10}")
+    else:
+        print(f"{'Base Model':<12} {'Method':<15} {'Helper Models':<20} {'Mean Token Time':<20}")
+    print("-" * 80)
+    
+    # Sort by method order
+    method_order = {'Autoregressive': 1, 'Speculative': 2, 'PipeSpec': 3}
+    results.sort(key=lambda x: method_order[x['method']])
+    
+    # Print results
+    for result in results:
+        helper_str = ','.join(result['helper_models']) if result['helper_models'] else '-'
+        if baseline_time:
+            speedup = baseline_time / result['time'] if result['method'] != 'Autoregressive' else 1.00
+            print(f"{result['base_model']:<12} {result['method']:<15} {helper_str:<20} {result['time']:.2f} ms/token {' '*5} {speedup:.2f}×")
+        else:
+            print(f"{result['base_model']:<12} {result['method']:<15} {helper_str:<20} {result['time']:.2f} ms/token")
+
+def analyze_results(root_folder: str):
+    """Analyze results for all dataset folders"""
+    # Process each dataset folder
+    for dataset_folder in os.listdir(root_folder):
+        folder_path = os.path.join(root_folder, dataset_folder)
+        if os.path.isdir(folder_path):
+            analyze_dataset_results(folder_path)
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze benchmark results and print statistics.")
-    parser.add_argument("input_files", nargs='+', help="Paths to the JSON files containing benchmark results")
+    parser.add_argument("folder", help="Path to the root folder containing dataset results")
     args = parser.parse_args()
     
-    analyze_results(args.input_files)
+    analyze_results(args.folder)
 
 if __name__ == "__main__":
     main()

@@ -105,7 +105,7 @@ def main():
                       help="Path or name of the dataset to use")
     parser.add_argument("--num-samples", type=int,
                       help="Number of samples to process (optional, processes all samples if not specified)")
-    parser.add_argument("--lookahead", type=int, default=4,
+    parser.add_argument("--lookahead", type=int, default=6,
                       help="Number of tokens to look ahead in speculative decoding")
     parser.add_argument("--models-config-path", type=str, required=True,
                       help="Path to the model configs JSON file")

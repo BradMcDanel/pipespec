@@ -7,6 +7,10 @@ import torch.multiprocessing as mp
 from transformers import BitsAndBytesConfig, DynamicCache
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
+from transformers.utils.logging import disable_progress_bar
+disable_progress_bar()
+
+
 
 def find_divergence_point(tensor1, tensor2):
     # Get the minimum length between the two tensors
@@ -96,7 +100,6 @@ def compute_verified_ids(input_ids, verify_output_ids):
     a = input_ids[:, 1:] != verify_output_ids[:, :-1]
     b = a.cumsum(-1) == 0
     idx =  b.sum(-1) + 1
-
     verify_ids = verify_output_ids[:, :idx[0]]
     return verify_ids
 
@@ -118,6 +121,8 @@ def perform_verification(input_ids, verify_outputs, output_ids, past_key_values,
 
 
 def verify_step(model, input_ids, output_ids, past_key_values, num_input_tokens, **kwargs):
+    num_input_ids = input_ids.size(1)
+
     # (1) Model forward pass
     with torch.no_grad():
         verify_outputs = model(input_ids=input_ids, past_key_values=past_key_values, use_cache=True)
@@ -138,17 +143,19 @@ def verify_step(model, input_ids, output_ids, past_key_values, num_input_tokens,
         "output_ids": output_ids,
         "past_key_values": past_key_values,
         "num_input_tokens": num_input_tokens,
-        "all_tokens_were_verified": num_verified_tokens == input_ids.size(1),
+        "all_tokens_were_verified": num_verified_tokens == num_input_ids,
         "num_verified_tokens": num_verified_tokens
     }
 
-def put_sm_tensor(src_tensor, sm_tensor):
-    src_tensor = src_tensor.squeeze(0)
-    sm_tensor[0] = src_tensor.size(0)
-    sm_tensor[1:src_tensor.size(0)+1] = src_tensor
+def put_sm_tensor(src_tensor, sm_tensor, lock):
+    with lock:
+        src_tensor = src_tensor.squeeze(0)
+        sm_tensor[0] = src_tensor.size(0)
+        sm_tensor[1:src_tensor.size(0)+1] = src_tensor
 
-def get_sm_tensor(sm_tensor):
-    return sm_tensor[1:sm_tensor[0].item()+1].unsqueeze(0)
+def get_sm_tensor(sm_tensor, lock):
+    with lock:
+        return sm_tensor[1:sm_tensor[0].item()+1].unsqueeze(0)
 
 def update_log(times_tensor, index_tensor, idx, elapsed_time):
     if idx >= times_tensor.size(0):
@@ -338,34 +345,6 @@ class ChainState:
             past_key_values=outputs["past_key_values"],
             num_input_tokens=outputs["num_input_tokens"]
         )
-@dataclass
-class SharedChainMemory:
-    """Shared memory for n-model chain"""
-    input_tensor: torch.Tensor
-    chain_tensors: List[torch.Tensor]  # One tensor per model in chain
-    rollback_requests: torch.Tensor    # Size (n-1) for n models, tracks requests between pairs
-    rollback_responses: torch.Tensor   # Size (n-1) for n models, tracks responses between pairs
-    execution_times: torch.Tensor      # Track execution time per model
-    accepted_tokens: torch.Tensor      # Track accepted tokens per verification
-    position_indices: torch.Tensor     # Track indices per position
-
-@dataclass
-class ChainEvents:
-    """Event system for n-model chain"""
-    def __init__(self, manager: mp.Manager, num_positions: int):
-        self.start = manager.Event()
-        self.completion = manager.Event()
-        self.close = manager.Event()
-        self.ready = [manager.Event() for _ in range(num_positions)]
-        self.reset = [manager.Event() for _ in range(num_positions)]
-        
-    def wait_all_ready(self):
-        for event in self.ready:
-            event.wait()
-            
-    def wait_reset(self, position: int):
-        self.reset[position].wait()
-        self.reset[position].clear()
 
 class ChainSpeculativeDecoder:
     def __init__(self, model_configs: List[ModelConfig], 
@@ -390,20 +369,21 @@ class ChainSpeculativeDecoder:
             self.models.append(model)
             if self.tokenizer is None:
                 self.tokenizer = tokenizer
-    
-    def _update_chain(self, states, start_idx, verified_output_ids):
-        """Update all models in chain from start_idx based on verified output"""
-        for i in range(start_idx, -1, -1):
-            states[i] = build_draft_inputs(verified_output_ids, **states[i])
+
+    @staticmethod
+    def update_states(states, output_ids):
+        for i in range(len(states)-1):
+            states[i] = build_draft_inputs(output_ids, **states[i])
+
         return states
-                
+    
     def generate(self, input_ids, return_metrics=False):
         metrics = {
             "model_times": [[] for _ in range(self.num_positions)],
             "accepted_tokens": [[] for _ in range(self.num_positions - 1)],
             "total_time": 0,
             "tokens_generated": 0
-        } if return_metrics else None
+        }
         
         start_time = time.time()
         
@@ -417,66 +397,49 @@ class ChainSpeculativeDecoder:
                 "past_key_values": outputs["past_key_values"],
                 "num_input_tokens": outputs["num_input_tokens"]
             })
+
+        states = self.update_states(states, states[-1]["output_ids"])
         
         while states[-1]["output_ids"].size(1) < self.max_new_tokens:
             # Draft phase for first model
             draft_token_start = time.time()
-            while (states[0]["output_ids"].size(1) < 
-                   states[-1]["output_ids"].size(1) + self.draft_lookahead):
+            while states[0]["output_ids"].size(1) - states[1]["output_ids"].size(1) < self.draft_lookahead - 1:
                 states[0] = step(self.models[0], **states[0])
-                if return_metrics:
-                    metrics["model_times"][0].append(time.time() - draft_token_start)
-                    draft_token_start = time.time()
+                metrics["model_times"][0].append(time.time() - draft_token_start)
+                draft_token_start = time.time()
             
             # Verify and draft through middle models
-            needs_chain_update = False
             for i in range(1, self.num_positions - 1):
-                verify_start = time.time()
-                prev_output_len = states[i]["output_ids"].size(1)
+                draft_start = time.time()
                 
                 # Verify tokens from previous model
                 states[i] = build_verify_inputs(states[i-1]["output_ids"], **states[i])
                 states[i] = verify_step(self.models[i], **states[i])
-                num_verified = states[i]["output_ids"].size(1) - prev_output_len
                 
-                if return_metrics:
-                    verify_time = time.time() - verify_start
-                    metrics["model_times"][i].append(verify_time)
-                    metrics["accepted_tokens"][i-1].append(num_verified)
-                
-                # Check if verification failed or minimal progress
-                if not states[i]["all_tokens_were_verified"] or num_verified <= 1:
-                    # Update all previous models in chain
-                    states = self._update_chain(states, i-1, states[i]["output_ids"])
-                    needs_chain_update = True
-                    
-                    # Generate new draft tokens
-                    draft_start = time.time()
-                    while (states[i]["output_ids"].size(1) < 
-                           states[-1]["output_ids"].size(1) + self.draft_lookahead):
-                        states[i] = step(self.models[i], **states[i])
-                        if return_metrics:
-                            metrics["model_times"][i].append(time.time() - draft_start)
-                            draft_start = time.time()
+                metrics["accepted_tokens"][i-1].append(states[i]["num_verified_tokens"])
+            
+                # Generate new draft tokens
+                while states[i]["output_ids"].size(1) - states[i+1]["output_ids"].size(1) < self.draft_lookahead - 1:
+                    states[i] = step(self.models[i], **states[i])
+
+                draft_time = time.time() - draft_start
+                metrics["model_times"][i].append(draft_time)
+
             
             # Final verification
             verify_start = time.time()
-            prev_output_len = states[-1]["output_ids"].size(1)
             states[-1] = build_verify_inputs(states[-2]["output_ids"], **states[-1])
             states[-1] = verify_step(self.models[-1], **states[-1])
-            num_verified = states[-1]["output_ids"].size(1) - prev_output_len
-            
-            if return_metrics:
-                verify_time = time.time() - verify_start
-                metrics["model_times"][-1].append(verify_time)
-                metrics["accepted_tokens"][-1].append(num_verified)
-            
-            # If final verification failed or minimal progress
-            if not states[-1]["all_tokens_were_verified"] or num_verified <= 1:
-                states = self._update_chain(states, self.num_positions-2, states[-1]["output_ids"])
-            
+
+            states = self.update_states(states, states[-1]["output_ids"])
+            verify_time = time.time() - verify_start
+
+            metrics["model_times"][-1].append(verify_time)
+            metrics["accepted_tokens"][-1].append(states[-1]["num_verified_tokens"])
+
+        
             # Check for EOS
-            if self.tokenizer.eos_token_id in states[-1]["output_ids"][0, -num_verified:]:
+            if self.tokenizer.eos_token_id in states[-1]["output_ids"]:
                 eos_index = (states[-1]["output_ids"][0] == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0][-1].item()
                 states[-1]["output_ids"] = states[-1]["output_ids"][:, :eos_index+1]
                 break
@@ -493,12 +456,45 @@ class ChainSpeculativeDecoder:
             
         return states[-1]["output_ids"][0]
 
+@dataclass
+class ChainEvents:
+    """Event system for n-model chain"""
+    def __init__(self, manager: mp.Manager, num_positions: int):
+        self.start = manager.Event()
+        self.completion = manager.Event()
+        self.close = manager.Event()
+        self.ready = [manager.Event() for _ in range(num_positions)]
+        self.reset = [manager.Event() for _ in range(num_positions)]
+        self.lock = manager.Lock()
+        
+    def wait_all_ready(self):
+        for event in self.ready:
+            event.wait()
+            
+    def wait_reset(self, position: int):
+        self.reset[position].wait()
+        self.reset[position].clear()
+
+@dataclass
+class SharedChainMemory:
+    """Shared memory for n-model chain"""
+    input_tensor: torch.Tensor
+    chain_tensors: List[torch.Tensor]  # One tensor per model in chain
+    rollback_requests: torch.Tensor    # Size (n-1) for n models, tracks requests between pairs  
+    rollback_responses: torch.Tensor   # Size (n-1) for n models, tracks responses between pairs
+    execution_times: torch.Tensor      # Track execution time per model
+    accepted_tokens: torch.Tensor      # Track accepted tokens per verification
+    position_indices: torch.Tensor     # Track indices per position
+
 class AsyncChainSpeculativeDecoder:
     """N-model chain-based speculative decoder"""
     def __init__(self, model_configs: List[ModelConfig],
-                 max_new_tokens: int = 4096, max_length: int = 8096,
-                 max_log_entries: int = 10000):
+                 draft_lookahead: int = 5,
+                 max_new_tokens: int = 4096, 
+                 max_length: int = 8096,
+                 max_log_entries: int = 100000):
         self.model_configs = model_configs
+        self.draft_lookahead = draft_lookahead
         self.max_new_tokens = max_new_tokens
         self.max_length = max_length
         self.max_log_entries = max_log_entries
@@ -517,7 +513,6 @@ class AsyncChainSpeculativeDecoder:
                 torch.zeros(self.max_length + 1, dtype=torch.long).share_memory_() 
                 for _ in range(self.num_positions)
             ],
-            # One pair of request/response counters between each adjacent pair of models
             rollback_requests=torch.zeros(self.num_positions - 1, dtype=torch.int32).share_memory_(),
             rollback_responses=torch.zeros(self.num_positions - 1, dtype=torch.int32).share_memory_(),
             execution_times=torch.zeros((self.num_positions, self.max_log_entries), 
@@ -528,17 +523,21 @@ class AsyncChainSpeculativeDecoder:
         )
 
     def _init_multiprocessing(self):
+        """Initialize multiprocessing components"""
         self.manager = mp.Manager()
         self.events = ChainEvents(self.manager, self.num_positions)
         self.pool = mp.Pool(processes=self.num_positions)
         self._start_processes()
 
     def _start_processes(self):
+        """Start all chain processes"""
         self.processes = []
         for i, config in enumerate(self.model_configs):
-            process = self.pool.apply_async(self._chain_process, 
-                                          (i, config, self.shared_memory, self.events, 
-                                           self.max_new_tokens, self.num_positions))
+            process = self.pool.apply_async(
+                self._chain_process, 
+                (i, config, self.shared_memory, self.events, 
+                 self.max_new_tokens, self.num_positions, self.draft_lookahead)
+            )
             self.processes.append(process)
         
         self.events.wait_all_ready()
@@ -546,7 +545,8 @@ class AsyncChainSpeculativeDecoder:
     @staticmethod
     def _chain_process(position: int, model_config: ModelConfig,
                       sm: SharedChainMemory, events: ChainEvents, 
-                      max_new_tokens: int, num_positions: int):
+                      max_new_tokens: int, num_positions: int,
+                      draft_lookahead: int):
         try:
             model, tokenizer = init_model(model_config)
             events.ready[position].set()
@@ -560,21 +560,22 @@ class AsyncChainSpeculativeDecoder:
                 local_index = 0
                 
                 # Initialize state with input
-                input_ids = get_sm_tensor(sm.input_tensor).to(model_config.device)
+                input_ids = get_sm_tensor(sm.input_tensor, events.lock).to(model_config.device)
                 outputs = step(model, input_ids)
                 state.curr = outputs["output_ids"]
                 state.past_key_values = outputs["past_key_values"]
                 state.num_input_tokens = outputs["num_input_tokens"]
-                put_sm_tensor(state.curr, sm.chain_tensors[position])
+                put_sm_tensor(state.curr, sm.chain_tensors[position], events.lock)
                 
                 if position == 0:  # First model (pure draft)
                     handled_rollback = False
                     while not events.completion.is_set():
                         start_time = time.time()
+                        ran_step = False
 
                         # Handle rollback from next model
                         if sm.rollback_requests[0] > sm.rollback_responses[0] and not handled_rollback:
-                            verify_output_ids = get_sm_tensor(sm.chain_tensors[position + 1])
+                            verify_output_ids = get_sm_tensor(sm.chain_tensors[position + 1], events.lock)
                             draft_inputs = build_draft_inputs(
                                 verify_output_ids,
                                 state.curr[:, -1:],
@@ -585,12 +586,11 @@ class AsyncChainSpeculativeDecoder:
                             state = ChainState.from_step_output(draft_inputs)
                             handled_rollback = True
 
-                        # Generate next token
                         outputs = step(model, state.curr[:, -1:],
                                      state.curr, state.past_key_values,
                                      state.num_input_tokens)
                         state = ChainState.from_step_output(outputs)
-                        put_sm_tensor(state.curr, sm.chain_tensors[position])
+                        put_sm_tensor(state.curr, sm.chain_tensors[position], events.lock)
 
                         # Signal rollback completion
                         if sm.rollback_requests[0] > sm.rollback_responses[0] and handled_rollback:
@@ -603,22 +603,27 @@ class AsyncChainSpeculativeDecoder:
                                  sm.position_indices[position:position+1],
                                  local_index, elapsed_time)
                         local_index += 1
-                
-                elif position < num_positions - 1:  # Middle models (verify only)
+                        
+                elif position < num_positions - 1:  # Middle models (verify and draft)
                     prev_pair = position - 1  # Index for previous model pair
                     next_pair = position      # Index for next model pair
                     handled_rollback = False
                     
                     while not events.completion.is_set():
                         start_time = time.time()
+                        ran_step = False
                         
                         # Wait for previous model's rollback completion if needed
                         while sm.rollback_requests[prev_pair] > sm.rollback_responses[prev_pair]:
                             time.sleep(0.001)
                             
+                        # Get current lengths
+                        curr_length = sm.chain_tensors[position][0]
+                        prev_length = sm.chain_tensors[position - 1][0]
+                            
                         # If we got a rollback request from next model
                         if sm.rollback_requests[next_pair] > sm.rollback_responses[next_pair] and not handled_rollback:
-                            verify_output_ids = get_sm_tensor(sm.chain_tensors[position + 1])
+                            verify_output_ids = get_sm_tensor(sm.chain_tensors[position + 1], events.lock)
                             draft_inputs = build_draft_inputs(
                                 verify_output_ids,
                                 state.curr[:, -1:],
@@ -629,37 +634,41 @@ class AsyncChainSpeculativeDecoder:
                             state = ChainState.from_step_output(draft_inputs)
                             handled_rollback = True
                         
-                        # Verify tokens from previous model (and generate next token)
-                        draft_output_ids = get_sm_tensor(sm.chain_tensors[position - 1])
-                        verify_inputs = build_verify_inputs(
-                            draft_output_ids,
-                            state.curr[:, -1:],
-                            state.curr,
-                            state.past_key_values,
-                            state.num_input_tokens
-                        )
-                        verify_outputs = verify_step(model, **verify_inputs)
-                        state = ChainState.from_step_output(verify_outputs)
-                        put_sm_tensor(state.curr, sm.chain_tensors[position])
-                        
-                        # Request rollback from previous model if verification failed
-                        if not verify_outputs["all_tokens_were_verified"] or \
-                            verify_outputs["num_verified_tokens"] == 1:
+                        if curr_length <= prev_length - draft_lookahead + 1:
+                            ran_step = True
+                            draft_output_ids = get_sm_tensor(sm.chain_tensors[position - 1], events.lock)
+                            verify_inputs = build_verify_inputs(
+                                draft_output_ids,
+                                state.curr[:, -1:],
+                                state.curr,
+                                state.past_key_values,
+                                state.num_input_tokens
+                            )
+                            verify_outputs = verify_step(model, **verify_inputs)
+                            state = ChainState.from_step_output(verify_outputs)
+                            put_sm_tensor(state.curr, sm.chain_tensors[position], events.lock)
+                            
+                            # Request rollback from previous model if verification failed
+                            # if not verify_outputs["all_tokens_were_verified"] or \
+                            #     verify_outputs["num_verified_tokens"] <= 1:
                             sm.rollback_requests[prev_pair] += 1
+                                
+                            # Log verification metrics
+                            sm.accepted_tokens[position-1, local_index] = verify_outputs["num_verified_tokens"]
                         
                         # Signal rollback completion to next model if we handled their request
                         if sm.rollback_requests[next_pair] > sm.rollback_responses[next_pair] and handled_rollback:
                             sm.rollback_responses[next_pair] += 1
                             handled_rollback = False
                         
-                        # Log metrics
-                        elapsed_time = time.time() - start_time
-                        update_log(sm.execution_times[position],
-                                  sm.position_indices[position:position+1],
-                                  local_index, elapsed_time)
-                        sm.accepted_tokens[position-1, local_index] = verify_outputs["num_verified_tokens"]
-                        local_index += 1 
-                
+                        # Log execution time
+                        if ran_step:
+                            elapsed_time = time.time() - start_time
+                            update_log(sm.execution_times[position],
+                                     sm.position_indices[position:position+1],
+                                     local_index, elapsed_time)
+                            local_index += 1
+
                 else:  # Last model (pure verify)
                     prev_pair = position - 1
                     while state.curr.size(1) < max_new_tokens:
@@ -669,38 +678,53 @@ class AsyncChainSpeculativeDecoder:
                         while sm.rollback_requests[prev_pair] > sm.rollback_responses[prev_pair]:
                             time.sleep(0.001)
                             
-                        # Verify tokens from previous model
-                        draft_output_ids = get_sm_tensor(sm.chain_tensors[position - 1])
-                        verify_inputs = build_verify_inputs(
-                            draft_output_ids,
-                            state.curr[:, -1:],
-                            state.curr,
-                            state.past_key_values,
-                            state.num_input_tokens
-                        )
-                        verify_outputs = verify_step(model, **verify_inputs)
-                        state = ChainState.from_step_output(verify_outputs)
-                        put_sm_tensor(state.curr, sm.chain_tensors[position])
-                        
-                        # Request rollback if needed
-                        if not verify_outputs["all_tokens_were_verified"] or \
-                           verify_outputs["num_verified_tokens"] == 1:
-                            sm.rollback_requests[prev_pair] += 1
+                        # Get current lengths
+                        curr_length = sm.chain_tensors[position][0]
+                        prev_length = sm.chain_tensors[prev_pair][0]
                             
-                        # Log metrics
+                        # Only verify if we have new draft tokens
+                        if curr_length <= prev_length - draft_lookahead + 1:
+                            # Verify tokens from previous model
+                            draft_output_ids = get_sm_tensor(sm.chain_tensors[position - 1], events.lock)
+                            verify_inputs = build_verify_inputs(
+                                draft_output_ids,
+                                state.curr[:, -1:],
+                                state.curr,
+                                state.past_key_values,
+                                state.num_input_tokens
+                            )
+                            verify_outputs = verify_step(model, **verify_inputs)
+                            state = ChainState.from_step_output(verify_outputs)
+                            put_sm_tensor(state.curr, sm.chain_tensors[position], events.lock)
+
+                            # Request rollback if needed
+                            # if not verify_outputs["all_tokens_were_verified"]:
+                            sm.rollback_requests[prev_pair] += 1
+                                
+                            # Log verification metrics
+                            sm.accepted_tokens[position-1, local_index] = verify_outputs["num_verified_tokens"]
+                            
+                            # Check for EOS token in newly verified tokens
+                            if tokenizer.eos_token_id in state.curr[0, -verify_outputs["num_verified_tokens"]:]:
+                                eos_index = (state.curr[0] == tokenizer.eos_token_id).nonzero(as_tuple=True)[0][-1].item()
+                                state.curr = state.curr[:, :eos_index+1]
+                                put_sm_tensor(state.curr, sm.chain_tensors[position], events.lock)
+                                events.completion.set()
+                                break
+                        else:
+                            continue
+
+                        
+                        # Log execution time
                         elapsed_time = time.time() - start_time
                         update_log(sm.execution_times[position],
                                  sm.position_indices[position:position+1],
                                  local_index, elapsed_time)
-                        sm.accepted_tokens[position-1, local_index] = verify_outputs["num_verified_tokens"]
                         local_index += 1
                         
-                        # Check for EOS token in newly verified tokens
-                        if tokenizer.eos_token_id in state.curr[0, -verify_outputs["num_verified_tokens"]:]:
-                            eos_index = (state.curr[0] == tokenizer.eos_token_id).nonzero(as_tuple=True)[0][-1].item()
-                            state.curr = state.curr[:, :eos_index+1]
-                            events.completion.set()
-                            break
+                        # Small sleep if we're waiting for draft tokens
+                        if prev_length <= curr_length:
+                            time.sleep(0.001)
                 
                 # Update final metrics and clear events
                 sm.position_indices[position] = local_index
@@ -733,7 +757,7 @@ class AsyncChainSpeculativeDecoder:
         self.events.wait_reset(0)
         
         # Get final output from last model
-        final_output = get_sm_tensor(self.shared_memory.chain_tensors[-1])[0]
+        final_output = get_sm_tensor(self.shared_memory.chain_tensors[-1], self.events.lock)[0]
         tokens_generated = len(final_output)
         time_per_token = total_time / tokens_generated if tokens_generated > 0 else 0
         
@@ -761,7 +785,7 @@ class AsyncChainSpeculativeDecoder:
         """Reset all shared memory tensors"""
         self.shared_memory.input_tensor.fill_(0)
         for tensor in self.shared_memory.chain_tensors:
-            tensor.fill_(0)
+            tensor.fill_(777)
         self.shared_memory.rollback_requests.fill_(0)
         self.shared_memory.rollback_responses.fill_(0)
         self.shared_memory.execution_times.fill_(0)
