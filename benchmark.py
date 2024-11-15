@@ -16,7 +16,7 @@ import gc
 MAX_NEW_TOKENS = 4096
 STRATEGIES = ['greedy', 'chain', 'async-chain']
 
-def create_output_filename(strategy: str, models_config: List[dict], output_dir: str) -> str:
+def create_output_filename(strategy: str, models_config: List[dict], output_dir: str, lookahead: Optional[int] = None) -> str:
     """Create a descriptive filename based on strategy and model configs"""
     # Extract model names from paths
     model_names = [os.path.basename(cfg['path'].rstrip('/')) for cfg in models_config]
@@ -26,8 +26,12 @@ def create_output_filename(strategy: str, models_config: List[dict], output_dir:
     else:
         model_str = model_names[0]
 
-    # Create filename
-    filename = f"{strategy}_{model_str}.json"
+    # Create filename with lookahead if provided
+    if lookahead is not None and strategy in ['chain', 'async-chain']:
+        filename = f"{strategy}_{model_str}_{lookahead}.json"
+    else:
+        filename = f"{strategy}_{model_str}.json"
+    
     # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
     return os.path.join(output_dir, filename)
@@ -105,17 +109,25 @@ def main():
                       help="Path or name of the dataset to use")
     parser.add_argument("--num-samples", type=int,
                       help="Number of samples to process (optional, processes all samples if not specified)")
-    parser.add_argument("--lookahead", type=int, default=6,
+    parser.add_argument("--lookahead", type=int, default=5,
                       help="Number of tokens to look ahead in speculative decoding")
     parser.add_argument("--models-config-path", type=str, required=True,
                       help="Path to the model configs JSON file")
     parser.add_argument("--output-dir", type=str, default="benchmark_results",
                       help="Output directory for results")
+    parser.add_argument("--force", action="store_true",
+                      help="Force overwrite if output file already exists")
     args = parser.parse_args()
     
     # Load model configurations
     with open(args.models_config_path, 'r') as f:
         models_json = json.load(f)
+    
+    # Check if output file already exists
+    output_file = create_output_filename(args.strategy, models_json, args.output_dir, args.lookahead)
+    if os.path.exists(output_file) and not args.force:
+        print(f"Warning: Output file {output_file} already exists. Skipping. Use --force to overwrite.")
+        return
         
     model_configs = []
     for cfg in models_json:
@@ -155,11 +167,10 @@ def main():
     }
     
     # Save results
-    output_file = create_output_filename(args.strategy, models_json, args.output_dir)
     with open(output_file, 'w') as f:
         json.dump(final_output, f, indent=2)
     
     print(f"Results saved to {output_file}")
 
-if __name__ == "__main__":
+if  __name__ == "__main__":
     main()

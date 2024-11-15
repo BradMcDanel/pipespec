@@ -7,15 +7,15 @@ COLOR_SCHEMES = {
         'BL(70B)': '#1f77b4',  # Classic blue for baseline
     },
     'speculative': {
-        'SD(8B,70B)': '#d62728',     # Deep red
-        'SD(1B,70B)': '#ff7f0e',     # Vibrant orange
-        'SD(1B,8B,70B)': '#ffd700',  # Gold yellow - made brighter and more distinct
+        'SD(1B,70B)':'#99d8c9',  # Light teal - distinct from medium 
+        'SD(8B,70B)': '#66c2a5',     # Teal green - completely different tone
+        'SD(1B,8B,70B)': '#2ca02c',     # Deep green
     },
     'pipespec': {
-        'PS(8B,70B)': '#2ca02c',     # Deep green
-        'PS(1B,70B)': '#66c2a5',     # Teal green - completely different tone
-        'PS(1B,8B,70B)': '#99d8c9',  # Light teal - distinct from medium
-    }
+        'PS(1B,70B)': '#ffd700',  # Gold yellow - made brighter and more distinct
+        'PS(8B,70B)': '#ff7f0e',     # Vibrant orange
+        'PS(1B,8B,70B)': '#d62728',     # Deep red
+    },
 }
 
 COLORS = {k: v for d in COLOR_SCHEMES.values() for k, v in d.items()}
@@ -37,13 +37,13 @@ def set_plotting_style(style: str = 'default') -> None:
         'font.serif': ['DejaVu Serif', 'Palatino', 'Times'],
         'mathtext.fontset': 'stix',  # Use STIX fonts for math
         
-        # Font sizes
-        'font.size': 9,
-        'axes.labelsize': 9,
-        'axes.titlesize': 10,
-        'xtick.labelsize': 8,
-        'ytick.labelsize': 8,
-        'legend.fontsize': 8,
+        # Significantly increased font sizes
+        'font.size': 14,              
+        'axes.labelsize': 14,         
+        'axes.titlesize': 16,         
+        'xtick.labelsize': 13,        
+        'ytick.labelsize': 13,        
+        'legend.fontsize': 13,        
         
         # Legend settings
         'legend.frameon': True,
@@ -57,7 +57,7 @@ def set_plotting_style(style: str = 'default') -> None:
         'grid.linestyle': '--',
         
         # Line settings
-        'lines.linewidth': 1.5,
+        'lines.linewidth': 2.0,
         
         # Spine settings
         'axes.spines.top': True,
@@ -73,15 +73,15 @@ def set_plotting_style(style: str = 'default') -> None:
         'savefig.pad_inches': 0.05,
         
         # Axes settings
-        'axes.linewidth': 0.8,
+        'axes.linewidth': 1.2,
         'axes.edgecolor': 'black',
         'axes.labelcolor': 'black',
         
         # Tick settings
-        'xtick.major.width': 0.8,
-        'ytick.major.width': 0.8,
-        'xtick.minor.width': 0.6,
-        'ytick.minor.width': 0.6,
+        'xtick.major.width': 1.2,
+        'ytick.major.width': 1.2,
+        'xtick.minor.width': 0.8,
+        'ytick.minor.width': 0.8,
         'xtick.direction': 'out',
         'ytick.direction': 'out',
     }
@@ -99,6 +99,7 @@ def set_plotting_style(style: str = 'default') -> None:
             'ytick.color': 'white',
         }
         plt.rcParams.update(dark_settings)
+
 
 def get_figure_axes(size: str = 'single_column', **kwargs) -> tuple:
     """Create figure and axes with standard sizes"""
@@ -131,10 +132,10 @@ def add_legend(ax: plt.Axes, **kwargs) -> None:
 # Model configurations for easy reference
 MODEL_CONFIGS = {
     'greedy_Meta-Llama-3.1-70B-Instruct.json': 'BL(70B)',
-    'chain_Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct.json': 'SD(8B,70B)',
-    'chain_Llama-3.2-1B-Instruct-Meta-Llama-3.1-70B-Instruct.json': 'SD(1B,70B)',
-    'chain_Llama-3.2-1B-Instruct-Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct.json': 'SD(1B,8B,70B)',
-    'async-chain_Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct.json': 'PS(8B,70B)',
-    'async-chain_Llama-3.2-1B-Instruct-Meta-Llama-3.1-70B-Instruct.json': 'PS(1B,70B)',
-    'async-chain_Llama-3.2-1B-Instruct-Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct.json': 'PS(1B,8B,70B)'
+    'chain_Llama-3.2-1B-Instruct-Meta-Llama-3.1-70B-Instruct_5.json': 'SD(1B,70B)',
+    'chain_Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct_5.json': 'SD(8B,70B)',
+    'chain_Llama-3.2-1B-Instruct-Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct_5.json': 'SD(1B,8B,70B)',
+    'async-chain_Llama-3.2-1B-Instruct-Meta-Llama-3.1-70B-Instruct_0.json': 'PS(1B,70B)',
+    'async-chain_Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct_0.json': 'PS(8B,70B)',
+    'async-chain_Llama-3.2-1B-Instruct-Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct_0.json': 'PS(1B,8B,70B)'
 }

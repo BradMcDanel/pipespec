@@ -6,7 +6,7 @@ import argparse
 from typing import Dict, List, Tuple
 import sys
 
-# sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import (
     set_plotting_style,
     get_figure_axes,
@@ -16,131 +16,147 @@ from utils import (
     MODEL_CONFIGS
 )
 
+def get_bin_index(token: int) -> int:
+    """
+    Get the bin index for a given token count.
+    
+    Args:
+        token: Number of tokens
+        
+    Returns:
+        Index of the bin this token count belongs to
+    """
+    if token <= 9:
+        return token - 1  # Bins 0-8 for tokens 1-9
+    elif token <= 14:
+        return 9  # Bin 9 for tokens 10-14
+    elif token <= 19:
+        return 10  # Bin 10 for tokens 15-19
+    elif token <= 24:
+        return 11  # Bin 11 for tokens 20-24
+    elif token <= 29:
+        return 12  # Bin 12 for tokens 25-29
+    else:
+        return 13  # Bin 13 for tokens 30+
 
-def analyze_token_frequencies(dir_path, file_path, x_max, tri_model=False, tri_model_acc_list=1):
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    target_path = os.path.join(current_dir, '..', dir_path, file_path)
-
-    with open(target_path, 'r') as file:
-        json_data = file.read()
-
-    # Initialize list of length x_max + 2 (indices 0 to x_max + 1)
-    token_frequencies = [0] * (x_max + 1)
+def analyze_token_frequencies(file_path: str) -> Tuple[List[float], int]:
+    """
+    Analyze token frequencies from a results file with custom binning.
+    
+    Args:
+        file_path: Path to the JSON results file
+        
+    Returns:
+        Tuple of normalized frequencies and total count
+    """
+    # 14 bins total: 1-9 individual, then 10-14, 15-19, 20-24, 25-29, 30+
+    token_frequencies = [0] * 14
     total_count = 0
 
-    # Parse the JSON data
-    data = json.loads(json_data)
+    with open(file_path, 'r') as file:
+        data = json.load(file)
 
     # Iterate through all results
-    for result in data['results']:
-        # Access the accepted_tokens arrays
-        acc_tokens = result['metrics']['accepted_tokens'][tri_model_acc_list] if tri_model else \
-        result['metrics']['accepted_tokens'][0]
-
+    for result in data.get('results', []):
+        metrics = result.get('metrics', {})
+        # Get the last accepted tokens array for speculative models
+        acc_tokens = metrics.get('accepted_tokens', [[]])[-1]
+        
         for token in acc_tokens:
-            # If token count would exceed x_max, cap it at x_max + 1
-            if token <= x_max:
-                token_frequencies[token-1] = token_frequencies[token-1] + 1
-            else:
-                token_frequencies[x_max] = token_frequencies[x_max] + 1
+            bin_idx = get_bin_index(token)
+            token_frequencies[bin_idx] += 1
             total_count += 1
 
-    normalized_frequencies = [round(freq / total_count, 2) if total_count > 0 else 0.00
-                            for freq in token_frequencies]
+    # Normalize frequencies to percentages
+    normalized_frequencies = [
+        round(freq / total_count * 100, 2) if total_count > 0 else 0.00
+        for freq in token_frequencies
+    ]
 
-    return normalized_frequencies
+    return normalized_frequencies, total_count
 
-
-def make_figure(pic, dir_path="benchmark_results/humaneval"):
+def plot_token_frequencies(folder_path: str):
+    """
+    Create token frequency plot for all models with custom binning.
+    
+    Args:
+        folder_path: Path to the folder containing result files
+    """
     set_plotting_style()
     fig, ax = get_figure_axes('double_column')
 
-    pic_name = pic[0]["pic_name"]
-    x_max = pic[0]["x_max"]
-    tri_list = pic[0]["tri_model_acc_list"]
-
-    tests = []
-    legends = []
-
-    for i in range(1, len(pic)):
-        filename = pic[i]["filename"]
-        test_data = analyze_token_frequencies(
-            dir_path=dir_path,
-            file_path=filename,
-            x_max=x_max,
-            tri_model=(i >= len(pic) - 2),
-            tri_model_acc_list=tri_list
-        )
-        tests.append(test_data)
-        legend_name = MODEL_CONFIGS[filename]
-        legends.append(legend_name)
-
-    x_labels = [str(i + 1) for i in range(x_max)]
-    x_labels.append(f'{x_max}+')
+    # Create x-axis labels
+    x_labels = [str(i) for i in range(1, 10)]  # 1-9
+    x_labels.extend(['10-14', '15-19', '20-24', '25-29', '30+'])
     x = np.arange(len(x_labels))
+    
+    # Filter out baseline model and count remaining models
+    spec_models = {k: v for k, v in MODEL_CONFIGS.items() 
+                  if not v.startswith('BL')}  # Skip baseline model
+    n_models = len(spec_models)
+    bar_width = 0.8 / n_models  # Leave 20% space between groups
+    
+    # Track processed models for legend
+    processed_models = []
 
-    bar_width = 0.2
-    for i, test_data in enumerate(tests):
-        offset = bar_width * (i - len(tests) / 2 + 0.5)
-        ax.bar(x + offset, test_data, bar_width,
-               label=legends[i],
-               color=COLORS[legends[i]],
-               alpha=0.8)
+    for i, (filename, model_name) in enumerate(spec_models.items()):
+        file_path = os.path.join(folder_path, filename)
+        if not os.path.exists(file_path):
+            print(f"Skipping {filename} - file not found")
+            continue
+            
+        print(f"Processing {model_name}")
+        frequencies, total_count = analyze_token_frequencies(file_path)
+        
+        if total_count > 0:
+            # Calculate offset for bar position
+            offset = bar_width * (i - n_models / 2 + 0.5)
+            
+            # Plot bars
+            ax.bar(x + offset, 
+                  frequencies, 
+                  bar_width,
+                  label=model_name,
+                  color=COLORS[model_name],
+                  alpha=0.8)
+            
+            processed_models.append(model_name)
 
+    # Style the plot
     style_axis(ax,
-               title=pic_name,
-               xlabel='Number of Accepted Tokens',
-               ylabel='Frequency (%)')
+              title='Token Frequency Distribution',
+              xlabel='Number of Accepted Tokens',
+              ylabel='Frequency (%)')
 
+    # Set x-axis ticks and labels
     ax.set_xticks(x)
     ax.set_xticklabels(x_labels)
 
-    # Simplified legend call
+    # Add legend with processed models only
     add_legend(ax,
-               loc='upper right',
-               bbox_to_anchor=(0.98, 0.98))
+              loc='upper right',
+              bbox_to_anchor=(0.98, 0.98))
 
     plt.tight_layout()
-    return fig, ax
-
-
-def save_figure(fig, name):
-    # Create figures directory if it doesn't exist
+    
+    # Save figures
     os.makedirs('figures', exist_ok=True)
-
+    output_path = os.path.join('figures', 'token-frequency-distribution')
+    
     # Save as PDF
-    pdf_path = os.path.join('figures', f'{name}.pdf')
-    fig.savefig(pdf_path, bbox_inches='tight', pad_inches=0.1)
-
+    plt.savefig(f'{output_path}.pdf', bbox_inches='tight', pad_inches=0.1)
+    
     # Save as PNG with high DPI
-    png_path = os.path.join('figures', f'{name}.png')
-    fig.savefig(png_path, bbox_inches='tight', pad_inches=0.1, dpi=300)
+    plt.savefig(f'{output_path}.png', bbox_inches='tight', pad_inches=0.1, dpi=300)
+    
+    plt.close()
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(description='Generate token frequency visualization')
-    parser.add_argument('--save', action='store_true',
-                      help='Save the figure to PDF and PNG files')
-    parser.add_argument('--show', action='store_true',
-                      help='Display the figure using plt.show()')
-    return parser.parse_args()
-
-
-pic1 = [{"pic_name": "Accepted tokens Frequency(8B-70B)", "tri_model_acc_list": 1, "x_max": 10},
-        {"filename": "chain_Llama-3.2-1B-Instruct-Meta-Llama-3.1-70B-Instruct.json"},
-        {"filename": "async-chain_Llama-3.2-1B-Instruct-Meta-Llama-3.1-70B-Instruct.json"},
-        {"filename": "chain_Llama-3.2-1B-Instruct-Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct.json"},
-        {"filename": "async-chain_Llama-3.2-1B-Instruct-Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct.json"}
-        ]
+def main():
+    parser = argparse.ArgumentParser(description="Generate token frequency plots for benchmark results.")
+    parser.add_argument("folder", help="Path to the folder containing results")
+    
+    args = parser.parse_args()
+    plot_token_frequencies(args.folder)
 
 if __name__ == "__main__":
-    args = parse_args()
-    fig, ax = make_figure(pic1)
-
-    if args.save:
-        save_figure(fig, args.output_name)
-
-    if args.show:
-        plt.show()
-
-
+    main()
