@@ -147,7 +147,7 @@ def plot_stacked_analysis(folder_path: str):
         ax.tick_params(axis='x', rotation=0)  # Ensure labels are horizontal
     
     # Add single legend at the top
-    legend = add_legend(ax1,
+    legend = add_legend(ax2,
                        loc='upper right',
                        bbox_to_anchor=(0.98, 0.98),
                        ncol=2)

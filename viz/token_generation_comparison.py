@@ -1,6 +1,5 @@
 import json
 import matplotlib.pyplot as plt
-import numpy as np
 import os
 import argparse
 from typing import Dict, List, Tuple
@@ -15,7 +14,6 @@ from viz.utils import (
     COLORS, 
     MODEL_CONFIGS
 )
-
 
 def get_cumulative_tokens_times(metrics: Dict, is_greedy: bool) -> Tuple[List[float], List[int]]:
     """Calculate cumulative tokens and times for a single sample"""
@@ -50,49 +48,10 @@ def get_cumulative_tokens_times(metrics: Dict, is_greedy: bool) -> Tuple[List[fl
     
     return cumulative_times, tokens
 
-def aggregate_samples(samples: List[Dict], is_greedy: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Aggregate data across all samples and compute statistics"""
-    all_times = []
-    all_tokens = []
-    
-    for sample in samples:
-        times, tokens = get_cumulative_tokens_times(sample['metrics'], is_greedy)
-        if times and tokens:
-            all_times.append(times)
-            all_tokens.append(tokens)
-    
-    if not all_times:
-        return np.array([]), np.array([]), np.array([]), np.array([])
-    
-    min_tokens = min(max(tokens) for tokens in all_tokens)
-    token_positions = np.arange(1, min_tokens + 1)
-    
-    aligned_times = []
-    for times, tokens in zip(all_times, all_tokens):
-        times = np.array(times)
-        tokens = np.array(tokens)
-        
-        mask = tokens <= min_tokens
-        if not any(mask):
-            continue
-            
-        times = times[mask]
-        tokens = tokens[mask]
-        
-        interpolated_times = np.interp(token_positions, tokens, times)
-        aligned_times.append(interpolated_times)
-    
-    aligned_times = np.array(aligned_times)
-    
-    mean_times = np.mean(aligned_times, axis=0)
-    std_times = np.std(aligned_times, axis=0)
-    
-    return token_positions, mean_times, mean_times - std_times, mean_times + std_times
-
 def plot_token_generation(folder_path: str):
-    """Create token generation plot with averaged samples"""
+    """Create token generation plot for a single sample"""
     set_plotting_style()
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = get_figure_axes(size='double_column')
     
     for filename, label in MODEL_CONFIGS.items():
         file_path = os.path.join(folder_path, filename)
@@ -103,39 +62,31 @@ def plot_token_generation(folder_path: str):
         with open(file_path, 'r') as f:
             data = json.load(f)
         
-        if not data.get("results"):
+        if not data.get("results") or not data["results"]:
             continue
         
+        # Take just the first sample
+        sample = data["results"][1]
         is_greedy = 'greedy' in filename
-        print(f"Processing {label} with {len(data['results'])} samples")
+        print(f"Processing {label} single sample")
         
-        tokens, mean_times, lower_times, upper_times = aggregate_samples(data["results"], is_greedy)
-        if len(tokens) > 0:
+        times, tokens = get_cumulative_tokens_times(sample['metrics'], is_greedy)
+        if times and tokens:
             color = COLORS[label]
-            ax.plot(mean_times, tokens, color=color, label=label, linewidth=1.5)
-            ax.fill_betweenx(tokens, lower_times, upper_times, color=color, alpha=0.1)
+            ax.plot(times, tokens, color=color, label=label, linewidth=1.5)
 
     style_axis(ax,
               xlabel='Time (seconds)',
               ylabel='Number of Verified Tokens',
               title='Token Generation Comparison')
     
-    # Move legend inside the plot area
-    legend = ax.legend(
-        loc='center right',    # Position on right side inside plot
-        bbox_to_anchor=(0.98, 0.5),  # Fine-tune position
-        ncol=1,               # Single column for better readability
-        frameon=True,         # Keep the frame
-        framealpha=0.9,       # Slightly transparent background
-        edgecolor='lightgray',# Subtle edge
-        handlelength=1.5,     # Keep shorter lines
-        borderpad=0.5,        # Padding inside the box
+    # Add legend with custom positioning
+    legend = add_legend(ax,
+        loc='lower right',
+        bbox_to_anchor=(0.98, 0.02),
+        ncol=1,
+        borderpad=0.5
     )
-    
-    # Set legend background color to white with some transparency
-    legend.get_frame().set_facecolor('white')
-    
-    plt.tight_layout()
     
     os.makedirs('figures', exist_ok=True)
     output_path = os.path.join('figures', f'token-generation-comparison.pdf')

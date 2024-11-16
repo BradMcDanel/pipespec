@@ -10,11 +10,13 @@ COLOR_SCHEMES = {
         'SD(1B,70B)':'#99d8c9',  # Light teal - distinct from medium 
         'SD(8B,70B)': '#66c2a5',     # Teal green - completely different tone
         'SD(1B,8B,70B)': '#2ca02c',     # Deep green
+        'SD(1B,8B)': '#2ca02c',     # Deep green
     },
     'pipespec': {
         'PS(1B,70B)': '#ffd700',  # Gold yellow - made brighter and more distinct
         'PS(8B,70B)': '#ff7f0e',     # Vibrant orange
         'PS(1B,8B,70B)': '#d62728',     # Deep red
+        'PS(1B,8B)': '#d62728',     # Deep red
     },
 }
 
@@ -132,9 +134,9 @@ def add_legend(ax: plt.Axes, **kwargs) -> None:
 # Model configurations for easy reference
 MODEL_CONFIGS = {
     'greedy_Meta-Llama-3.1-70B-Instruct.json': 'BL(70B)',
-    'chain_Llama-3.2-1B-Instruct-Meta-Llama-3.1-70B-Instruct_5.json': 'SD(1B,70B)',
-    'chain_Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct_5.json': 'SD(8B,70B)',
-    'chain_Llama-3.2-1B-Instruct-Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct_5.json': 'SD(1B,8B,70B)',
+    'chain_Llama-3.2-1B-Instruct-Meta-Llama-3.1-70B-Instruct_8.json': 'SD(1B,70B)',
+    'chain_Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct_8.json': 'SD(8B,70B)',
+    'chain_Llama-3.2-1B-Instruct-Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct_8.json': 'SD(1B,8B,70B)',
     'async-chain_Llama-3.2-1B-Instruct-Meta-Llama-3.1-70B-Instruct_0.json': 'PS(1B,70B)',
     'async-chain_Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct_0.json': 'PS(8B,70B)',
     'async-chain_Llama-3.2-1B-Instruct-Llama-3.1-8B-Instruct-Meta-Llama-3.1-70B-Instruct_0.json': 'PS(1B,8B,70B)'
