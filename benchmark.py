@@ -44,11 +44,12 @@ def run_benchmark(args, strategy: str, model_configs: List[decoding.ModelConfig]
         if len(model_configs) < 2:
             raise ValueError("chain strategy requires at least 2 models")
         decoder = decoding.ChainSpeculativeDecoder(model_configs, draft_lookahead=args.lookahead, 
-                                                 max_new_tokens=MAX_NEW_TOKENS)
+                                                   max_new_tokens=MAX_NEW_TOKENS)
     elif strategy == 'async-chain':
         if len(model_configs) < 2:
             raise ValueError("async-chain strategy requires at least 2 models")
-        decoder = decoding.AsyncChainSpeculativeDecoder(model_configs, max_new_tokens=MAX_NEW_TOKENS)
+        decoder = decoding.AsyncChainSpeculativeDecoder(model_configs, draft_lookahead=args.lookahead,
+                                                        max_new_tokens=MAX_NEW_TOKENS)
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
 

@@ -4,7 +4,6 @@ import os
 import argparse
 from typing import Dict, List, Tuple
 import sys
-
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from viz.utils import (
     set_plotting_style, 
@@ -51,7 +50,9 @@ def get_cumulative_tokens_times(metrics: Dict, is_greedy: bool) -> Tuple[List[fl
 def plot_token_generation(folder_path: str):
     """Create token generation plot for a single sample"""
     set_plotting_style()
-    fig, ax = get_figure_axes(size='double_column')
+    
+    # Create wider, shorter figure for double-column format
+    fig, ax = plt.subplots(figsize=(7, 4))  # Adjusted to be wider and shorter
     
     for filename, label in MODEL_CONFIGS.items():
         file_path = os.path.join(folder_path, filename)
@@ -65,7 +66,6 @@ def plot_token_generation(folder_path: str):
         if not data.get("results") or not data["results"]:
             continue
         
-        # Take just the first sample
         sample = data["results"][1]
         is_greedy = 'greedy' in filename
         print(f"Processing {label} single sample")
@@ -73,25 +73,34 @@ def plot_token_generation(folder_path: str):
         times, tokens = get_cumulative_tokens_times(sample['metrics'], is_greedy)
         if times and tokens:
             color = COLORS[label]
-            ax.plot(times, tokens, color=color, label=label, linewidth=1.5)
-
+            ax.plot(times, tokens, color=color, label=label, linewidth=2.0)  # Increased line thickness
+    
     style_axis(ax,
               xlabel='Time (seconds)',
               ylabel='Number of Verified Tokens',
               title='Token Generation Comparison')
     
-    # Add legend with custom positioning
+    # Adjusted legend position for shorter plot
     legend = add_legend(ax,
         loc='lower right',
         bbox_to_anchor=(0.98, 0.02),
-        ncol=1,
-        borderpad=0.5
+        borderaxespad=0,
+        borderpad=0.1,           # Reduced padding
+        handlelength=1.0,
+        handletextpad=0.3,       # Reduced spacing
+        ncol=2                   # Use two columns to save vertical space
     )
+    
+    # Tighter layout with smaller margins
+    plt.tight_layout(pad=0.2)
     
     os.makedirs('figures', exist_ok=True)
     output_path = os.path.join('figures', f'token-generation-comparison.pdf')
-    plt.savefig(output_path, bbox_inches='tight', pad_inches=0.1)
+    plt.savefig(output_path, bbox_inches='tight', pad_inches=0.02)  # Reduced padding
     plt.close()
+    
+    # Reset to default style after saving
+    set_plotting_style()
 
 def main():
     parser = argparse.ArgumentParser(description="Generate token generation plots for benchmark results.")

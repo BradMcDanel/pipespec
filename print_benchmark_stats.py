@@ -1,146 +1,159 @@
 import json
 import argparse
-import os
-from typing import List, Dict, Any
+from typing import Dict, Any, List, Set
+from statistics import mean
+from dataclasses import dataclass
+from pathlib import Path
 
-def extract_model_sizes(model_str: str) -> List[str]:
-    """Extract model sizes from a model string"""
-    models = []
-    for part in model_str.split('-'):
-        if part.endswith('B'):
-            models.append(part)
-    return models
+# Model name mappings
+MODEL_NAMES = {
+    "1B": "Llama-3.2-1B-Instruct",
+    "8B": "Llama-3.1-8B-Instruct",
+    "70B": "Meta-Llama-3.1-70B-Instruct"
+}
 
-def get_model_size_value(size_str: str) -> int:
-    """Convert model size string to numeric value (e.g., '70B' -> 70)"""
-    return int(size_str.rstrip('B'))
+# Strategy name mappings with their run number suffixes
+STRATEGIES = {
+    "base": {"prefix": "greedy", "suffix": ".json"},          # no run number for baseline
+    "spec": {"prefix": "chain", "suffix": "_8.json"},        # speculative uses _8
+    "pipe": {"prefix": "async-chain", "suffix": "_0.json"}   # pipespec uses _0
+}
 
-def find_largest_model_size(file_paths: List[str]) -> str:
-    """Find the largest model size from a list of file paths"""
-    max_size = 0
-    max_size_str = None
-    
-    for path in file_paths:
-        filename = os.path.basename(path)
-        model_str = filename.split('_')[1].replace('.json', '')
-        sizes = extract_model_sizes(model_str)
-        if sizes:
-            size_value = get_model_size_value(sizes[-1])  # Get the last (largest) model size
-            if size_value > max_size:
-                max_size = size_value
-                max_size_str = sizes[-1]
-    
-    return max_size_str
+@dataclass
+class ResultGroup:
+    dataset_name: str
+    dataset_folder: str
+    baseline_model: str
+    experiments: List[Dict[str, str]]
 
-def analyze_dataset_results(folder_path: str):
-    """Analyze results for a single dataset folder"""
-    # Get all JSON files in the folder
-    file_paths = [os.path.join(folder_path, f) for f in os.listdir(folder_path) 
-                 if f.endswith('.json')]
+def make_pattern(strategy: str, models: List[str]) -> str:
+    """Create file pattern from strategy and models with appropriate suffix"""
+    strat = STRATEGIES[strategy]
+    return f"{strat['prefix']}_" + "-".join(MODEL_NAMES[m] for m in models) + strat['suffix']
+
+# Configure the result groups we want to analyze
+RESULT_GROUPS = [
+    ResultGroup(
+        dataset_name="HumanEval",
+        dataset_folder="humaneval",
+        baseline_model="70B",
+        experiments=[
+            # Baseline autoregressive
+            {"pattern": make_pattern("base", ["70B"]), "method": "Autoregressive", "models": "L-70B"},
+            # Speculative variants
+            {"pattern": make_pattern("spec", ["1B", "70B"]), "method": "Speculative", "models": "L-1B,L-70B"},
+            {"pattern": make_pattern("spec", ["8B", "70B"]), "method": "Speculative", "models": "L-8B,L-70B"},
+            {"pattern": make_pattern("spec", ["1B", "8B", "70B"]), "method": "Speculative", "models": "L-1B,L-8B,L-70B"},
+            # PipeSpec variants
+            {"pattern": make_pattern("pipe", ["8B", "70B"]), "method": "PipeSpec", "models": "L-8B,L-70B"},
+            {"pattern": make_pattern("pipe", ["1B", "70B"]), "method": "PipeSpec", "models": "L-1B,L-70B"},
+            {"pattern": make_pattern("pipe", ["1B", "8B", "70B"]), "method": "PipeSpec", "models": "L-1B,L-8B,L-70B"},
+        ]
+    )
+]
+
+def get_active_gpus(metadata: Dict[str, Any]) -> Set[int]:
+    """Extract active GPU indices from metadata"""
+    active_gpus = set()
+    for config in metadata["model_configs"]:
+        for device in config["devices"]:
+            if device.startswith("cuda:"):
+                gpu_idx = int(device.split(":")[1])
+                active_gpus.add(gpu_idx)
+    return active_gpus
+
+def find_matching_file(directory: Path, pattern: str) -> Path:
+    """Find a file matching the pattern in the directory"""
+    for file in directory.glob("*.json"):
+        if pattern in file.name:
+            return file
+    raise FileNotFoundError(f"No file matching pattern '{pattern}' found in {directory}")
+
+def analyze_single_file(file_path: str) -> Dict[str, float]:
+    """Analyze a single results file and return key metrics"""
+    with open(file_path, 'r') as f:
+        data = json.load(f)
     
-    # Find the largest model size in this dataset
-    largest_model = find_largest_model_size(file_paths)
-    if not largest_model:
-        print(f"Error: Could not determine largest model size in {folder_path}")
-        return
+    active_gpus = get_active_gpus(data["metadata"])
     
-    # Find baseline (largest model with greedy decoding)
-    baseline_time = None
-    for file_path in file_paths:
-        filename = os.path.basename(file_path)
-        if filename.startswith('greedy_') and largest_model in filename:
-            with open(file_path, 'r') as f:
-                data = json.load(f)
+    # Initialize aggregation variables
+    total_time = 0
+    total_tokens = 0
+    gpu_utils = {gpu_idx: [] for gpu_idx in active_gpus}
+    gpu_powers = {gpu_idx: [] for gpu_idx in active_gpus}
+    
+    # Process each sample
+    for sample in data["results"]:
+        metrics = sample["metrics"]
+        total_time += metrics['total_time']
+        total_tokens += metrics['tokens_generated']
+        
+        # Process GPU stats
+        for stat in sample["gpustats"]:
+            for gpu_idx in active_gpus:
+                gpu_utils[gpu_idx].append(stat["gpu_utilizations"][gpu_idx])
+                gpu_powers[gpu_idx].append(stat["gpu_powers"][gpu_idx])
+    
+    # Calculate averages
+    avg_time_per_token = (total_time / total_tokens) * 1000 if total_tokens > 0 else 0
+    
+    # Calculate GPU averages
+    avg_util = mean([mean(utils) for utils in gpu_utils.values()])
+    avg_power = mean([mean(powers) for powers in gpu_powers.values()])
+    
+    # Calculate total energy and energy per token
+    total_energy = sum([mean(powers) * total_time for powers in gpu_powers.values()])
+    energy_per_token = total_energy / total_tokens if total_tokens > 0 else 0
+    
+    return {
+        "avg_time": avg_time_per_token,
+        "avg_util": avg_util,
+        "avg_power": avg_power,
+        "energy_per_token": energy_per_token
+    }
+
+def generate_results_table(results_dir: str):
+    """Generate results table from configured experiments"""
+    results_path = Path(results_dir)
+    
+    print("\nResults Table")
+    print("=" * 120)
+    print(f"{'Dataset':<15} {'Method':<15} {'Models':<20} {'Avg Time (ms)':<15} {'Speedup':<10} "
+          f"{'Avg Util (%)':<12} {'Avg Power (W)':<15} {'Energy/tok (J)'}")
+    print("-" * 120)
+    
+    for group in RESULT_GROUPS:
+        baseline_metrics = None
+        
+        for exp in group.experiments:
+            try:
+                file_path = find_matching_file(results_path / group.dataset_folder, exp["pattern"])
+                metrics = analyze_single_file(str(file_path))
                 
-            total_time = 0
-            total_tokens = 0
-            for sample in data["results"]:
-                metrics = sample["metrics"]
-                total_time += metrics['total_time']
-                total_tokens += metrics['tokens_generated']
-            
-            baseline_time = (total_time / total_tokens) * 1000
-            break
-    
-    # Collect all results for largest model
-    results = []
-    for file_path in file_paths:
-        filename = os.path.basename(file_path)
-        if not largest_model in filename:
-            continue
-            
-        strategy = filename.split('_')[0]
-        model_str = filename.split('_')[1].replace('.json', '')
-        model_sizes = extract_model_sizes(model_str)
+                # If this is the baseline experiment, save its metrics
+                if exp["method"] == "Autoregressive":
+                    baseline_metrics = metrics
+                
+                # Calculate speedup relative to baseline
+                speedup = baseline_metrics["avg_time"] / metrics["avg_time"] if baseline_metrics else 1.0
+                
+                print(f"{group.dataset_name:<15} {exp['method']:<15} {exp['models']:<20} "
+                      f"{metrics['avg_time']:.2f}{'ms':<9} {speedup:.2f}{'×':<8} "
+                      f"{metrics['avg_util']:.1f}{'%':<9} {metrics['avg_power']:.1f}{'W':<11} "
+                      f"{metrics['energy_per_token']:.2f}")
+                
+            except FileNotFoundError as e:
+                print(f"Warning: {e}")
+                continue
         
-        with open(file_path, 'r') as f:
-            data = json.load(f)
-            
-        # Calculate average time per token
-        total_time = 0
-        total_tokens = 0
-        for sample in data["results"]:
-            metrics = sample["metrics"]
-            total_time += metrics['total_time']
-            total_tokens += metrics['tokens_generated']
-        
-        avg_time = (total_time / total_tokens) * 1000  # convert to ms
-        
-        # Format the configuration name with new naming convention
-        if 'async-chain' in strategy:
-            method = 'PipeSpec'
-        elif 'chain' in strategy:
-            method = 'Speculative'
-        elif 'greedy' in strategy:
-            method = 'Autoregressive'
-            
-        results.append({
-            'method': method,
-            'time': avg_time,
-            'base_model': model_sizes[-1],
-            'helper_models': model_sizes[:-1] if len(model_sizes) > 1 else [],
-            'full_path': file_path
-        })
-    
-    # Print results
-    dataset_name = os.path.basename(folder_path)
-    print(f"\nResults for dataset: {dataset_name}")
-    print("=" * 80)
-    
-    # Print header
-    if baseline_time:
-        print(f"{'Base Model':<12} {'Method':<15} {'Helper Models':<20} {'Mean Token Time':<20} {'Speedup':<10}")
-    else:
-        print(f"{'Base Model':<12} {'Method':<15} {'Helper Models':<20} {'Mean Token Time':<20}")
-    print("-" * 80)
-    
-    # Sort by method order
-    method_order = {'Autoregressive': 1, 'Speculative': 2, 'PipeSpec': 3}
-    results.sort(key=lambda x: method_order[x['method']])
-    
-    # Print results
-    for result in results:
-        helper_str = ','.join(result['helper_models']) if result['helper_models'] else '-'
-        if baseline_time:
-            speedup = baseline_time / result['time'] if result['method'] != 'Autoregressive' else 1.00
-            print(f"{result['base_model']:<12} {result['method']:<15} {helper_str:<20} {result['time']:.2f} ms/token {' '*5} {speedup:.2f}×")
-        else:
-            print(f"{result['base_model']:<12} {result['method']:<15} {helper_str:<20} {result['time']:.2f} ms/token")
-
-def analyze_results(root_folder: str):
-    """Analyze results for all dataset folders"""
-    # Process each dataset folder
-    for dataset_folder in os.listdir(root_folder):
-        folder_path = os.path.join(root_folder, dataset_folder)
-        if os.path.isdir(folder_path):
-            analyze_dataset_results(folder_path)
+        print("-" * 120)
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze benchmark results and print statistics.")
-    parser.add_argument("folder", help="Path to the root folder containing dataset results")
+    parser = argparse.ArgumentParser(description="Generate results table from benchmark results.")
+    parser.add_argument("directory", help="Path to the root directory containing benchmark results")
     args = parser.parse_args()
     
-    analyze_results(args.folder)
+    generate_results_table(args.directory)
 
 if __name__ == "__main__":
     main()

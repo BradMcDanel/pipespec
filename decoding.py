@@ -57,7 +57,8 @@ def step(model, input_ids, output_ids=None, past_key_values=None, num_input_toke
         "past_key_values": past_key_values
     }
 
-def build_verify_inputs(draft_output_ids, input_ids, output_ids, past_key_values, num_input_tokens, **kwargs):
+
+def build_verify_inputs(draft_output_ids, input_ids, output_ids, past_key_values, num_input_tokens, max_verify_tokens=100, **kwargs):
     draft_ids = draft_output_ids.to(output_ids.device)
 
     # Get lengths of both tensors
@@ -68,7 +69,10 @@ def build_verify_inputs(draft_output_ids, input_ids, output_ids, past_key_values
     if verify_len > draft_len or not torch.equal(output_ids[:, :verify_len], draft_ids[:, :verify_len]):
         pass
     else:
-        input_ids = draft_ids[:, verify_len-1:]
+        # Take last token of verified sequence plus up to max_verify_tokens from draft
+        start_idx = verify_len - 1
+        end_idx = min(verify_len - 1 + max_verify_tokens, draft_len)
+        input_ids = draft_ids[:, start_idx:end_idx]
 
     return {
         "output_ids": output_ids,
@@ -76,6 +80,7 @@ def build_verify_inputs(draft_output_ids, input_ids, output_ids, past_key_values
         "past_key_values": past_key_values,
         "num_input_tokens": num_input_tokens
     }
+ 
 
 def build_draft_inputs(verify_output_ids, input_ids, output_ids, past_key_values, num_input_tokens, **kwargs):
     verify_ids = verify_output_ids.to(input_ids.device)
@@ -272,6 +277,7 @@ class GreedyDecoder:
 
     def _init_model(self):
         self.model, self.tokenizer = init_model(self.model_config)
+        self.model.eval()
 
     def generate(self, input_ids, return_metrics=False):
         start_time = time.time()
@@ -331,6 +337,7 @@ class ChainSpeculativeDecoder:
         
         for config in self.model_configs:
             model, tokenizer = init_model(config)
+            model.eval()
             self.models.append(model)
             if self.tokenizer is None:
                 self.tokenizer = tokenizer
@@ -449,7 +456,7 @@ class SharedChainMemory:
 class AsyncChainSpeculativeDecoder:
     """N-model chain-based speculative decoder"""
     def __init__(self, model_configs: List[ModelConfig],
-                 draft_lookahead: int = 5,
+                 draft_lookahead: int = 0,
                  max_new_tokens: int = 4096, 
                  max_length: int = 8096,
                  max_log_entries: int = 100000):
@@ -510,6 +517,7 @@ class AsyncChainSpeculativeDecoder:
         """Chain process worker with graceful shutdown handling"""
         try:
             model, tokenizer = init_model(model_config)
+            model.eval()
             events.ready[position].set()
             
             while True:

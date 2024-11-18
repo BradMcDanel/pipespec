@@ -3,10 +3,10 @@ import torch.multiprocessing as mp
 import pynvml
 
 class GPUMonitor:
-    def __init__(self, interval=0.5):
+    def __init__(self, interval=0.1):
         self.interval = interval
         self.stop_event = mp.Event()
-        self.queue = mp.Queue(maxsize=1000)  # Set a max size to prevent memory issues
+        self.queue = mp.Queue(maxsize=100000)  # Set a max size to prevent memory issues
         self.results = []
         self.process = None
         
