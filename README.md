@@ -37,14 +37,18 @@ This repository contains an implementation of a novel hierarchical decoding stra
 
 ## Installation
 
-Clone the repository and navigate into the directory:
+Create a new conda environment and activate it:
 
 ```bash
-git clone <repository-url>
-cd <repository-directory>
+conda create --name pipespec python=3.8 -y
+conda activate pipespec
 ```
 
-Install the necessary Python packages (e.g., PyTorch, Transformers, Datasets, tqdm, pynvml, Matplotlib, NumPy, SciPy).
+Then, install the required Python packages:
+
+```bash
+pip install -r requirements.txt
+```
 
 ---
 
