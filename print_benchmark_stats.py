@@ -1,159 +1,211 @@
 import json
-import argparse
-from typing import Dict, Any, List, Set
-from statistics import mean
-from dataclasses import dataclass
 from pathlib import Path
 
-# Model name mappings
-MODEL_NAMES = {
-    "1B": "Llama-3.2-1B-Instruct",
-    "8B": "Llama-3.1-8B-Instruct",
-    "70B": "Meta-Llama-3.1-70B-Instruct"
+MODELS = {
+    "68m": "llama-68m",
+    "1b": "Llama-3.2-1B-Instruct",
+    "7b": "Llama-2-7b-hf",
+    "8b": "Llama-3.1-8B-Instruct",
+    "13b": "Llama-2-13b-hf",
+    "70b": "Meta-Llama-3.1-70B-Instruct"
 }
 
-# Strategy name mappings with their run number suffixes
-STRATEGIES = {
-    "base": {"prefix": "greedy", "suffix": ".json"},          # no run number for baseline
-    "spec": {"prefix": "chain", "suffix": "_8.json"},        # speculative uses _8
-    "pipe": {"prefix": "async-chain", "suffix": "_0.json"}   # pipespec uses _0
-}
+def make_path(decoding, models):
+    prefix = {"base": "greedy", "spec": "chain", "pipe": "async-chain"}[decoding]
+    suffix = {"base": "", "spec": "_8", "pipe": "_0"}[decoding]
+    return f"{prefix}_" + "-".join(MODELS[m] for m in models) + f"{suffix}.json"
 
-@dataclass
-class ResultGroup:
-    dataset_name: str
-    dataset_folder: str
-    baseline_model: str
-    experiments: List[Dict[str, str]]
-
-def make_pattern(strategy: str, models: List[str]) -> str:
-    """Create file pattern from strategy and models with appropriate suffix"""
-    strat = STRATEGIES[strategy]
-    return f"{strat['prefix']}_" + "-".join(MODEL_NAMES[m] for m in models) + strat['suffix']
-
-# Configure the result groups we want to analyze
-RESULT_GROUPS = [
-    ResultGroup(
-        dataset_name="HumanEval",
-        dataset_folder="humaneval",
-        baseline_model="70B",
-        experiments=[
-            # Baseline autoregressive
-            {"pattern": make_pattern("base", ["70B"]), "method": "Autoregressive", "models": "L-70B"},
-            # Speculative variants
-            {"pattern": make_pattern("spec", ["1B", "70B"]), "method": "Speculative", "models": "L-1B,L-70B"},
-            {"pattern": make_pattern("spec", ["8B", "70B"]), "method": "Speculative", "models": "L-8B,L-70B"},
-            {"pattern": make_pattern("spec", ["1B", "8B", "70B"]), "method": "Speculative", "models": "L-1B,L-8B,L-70B"},
-            # PipeSpec variants
-            {"pattern": make_pattern("pipe", ["8B", "70B"]), "method": "PipeSpec", "models": "L-8B,L-70B"},
-            {"pattern": make_pattern("pipe", ["1B", "70B"]), "method": "PipeSpec", "models": "L-1B,L-70B"},
-            {"pattern": make_pattern("pipe", ["1B", "8B", "70B"]), "method": "PipeSpec", "models": "L-1B,L-8B,L-70B"},
-        ]
-    )
+# [dataset, base_model, folder_path, [(method, display_models, decoding, model_list[, speedup, citation])]]
+EXPERIMENTS = [
+    ["CNN/DM", "7b", "cnn_dailymail", [
+        ("Autoregressive", "LLaMA2-7B", "base", ["7b"]),
+        ("Speculative", "68M, 7B", "spec", ["68m", "7b"]),
+        ("LayerSkip", "LLaMA2-7B", None, None, 1.86, "elhoushi2024layer"),
+        ("PipeSpec", "68M, 7B", "pipe", ["68m", "7b"])
+    ]],
+    ["CNN/DM", "13b", "cnn_dailymail", [
+        ("Autoregressive", "LLaMA2-13B", "base", ["13b"]),
+        # ("Speculative", "68M, 13B", "spec", ["68m", "13b"]),
+        ("Speculative", "68M, 7B, 13B", "spec", ["68m", "7b", "13b"]),
+        ("Draft\\&Verify", "LLaMA2-13B", None, None, 1.56, "zhang2023draft"),
+        ("LayerSkip", "LLaMA2-13B", None, None, 1.81, "elhoushi2024layer"),
+        ("PipeSpec", "68M, 13B", "pipe", ["68m", "13b"]),
+        ("PipeSpec", "7B, 13B", "pipe", ["7b", "13b"]),
+        ("PipeSpec", "68M, 7B,13B", "pipe", ["68m", "7b", "13b"])
+    ]],
+    ["XSum", "7b", "xsum", [
+        ("Autoregressive", "LLaMA2-7B", "base", ["7b"]),
+        ("Speculative", "68M, 7B", "spec", ["68m", "7b"]),
+        ("LayerSkip", "LLaMA2-7B", None, None, 1.54, "elhoushi2024layer"),
+        ("PipeSpec", "68M, 7B", "pipe", ["68m", "7b"])
+    ]],
+    ["XSum", "13b", "xsum", [
+        ("Autoregressive", "LLaMA2-13B", "base", ["13b"]),
+        ("Speculative", "68M, 13B", "spec", ["68m", "13b"]),
+        ("Speculative", "68M, 7B, 13B", "spec", ["68m", "7b", "13b"]),
+        ("Draft\\&Verify", "LLaMA2-13B", None, None, 1.43, "zhang2023draft"),
+        ("LayerSkip", "LLaMA2-13B", None, None, 1.48, "elhoushi2024layer"),
+        ("PipeSpec", "68M, 13B", "pipe", ["68m", "13b"]),
+        ("PipeSpec", "7B, 13B", "pipe", ["7b", "13b"]),
+        ("PipeSpec", "68M, 7B, 13B", "pipe", ["68m", "7b", "13b"])
+    ]],
+    ["HumanEval", "13b", "human_eval", [
+        ("Autoregressive", "LLaMA2-13B", "base", ["13b"]),
+        ("Speculative", "68M, 13B", "spec", ["68m", "13b"]),
+        ("Speculative", "68M, 7B, 13B", "spec", ["68m", "7b", "13b"]),
+        ("Draft\\&Verify", "CodeLLaMA2-13B", None, None, 1.46, "zhang2023draft"),
+        ("LayerSkip", "LLaMA2-13B", None, None, 1.66, "elhoushi2024layer"),
+        ("PipeSpec", "68M, 13B", "pipe", ["68m", "13b"]),
+        ("PipeSpec", "7B, 13B", "pipe", ["7b", "13b"]),
+        ("PipeSpec", "68M, 7B, 13B", "pipe", ["68m", "7b", "13b"])
+    ]],
+    ["HumanEval", "70b", "human_eval", [
+        ("Autoregressive", "LLaMA3.1-70B", "base", ["70b"]),
+        ("Speculative", "8B, 70B", "spec", ["8b", "70b"]),
+        ("Speculative", "1B, 8B, 70B", "spec", ["1b", "8b", "70b"]),
+        ("PipeSpec", "1B, 70B", "pipe", ["1b", "70b"]),
+        ("PipeSpec", "8B, 70B", "pipe", ["8b", "70b"]),
+        ("PipeSpec", "1B, 8B, 70B", "pipe", ["1b", "8b", "70b"])
+    ]],
+    ["GSM8K", "13b", "gsm8k", [
+        ("Autoregressive", "LLaMA2-13B", "base", ["13b"]),
+        ("PipeSpec", "68M, 7B, 13B", "pipe", ["68m", "7b", "13b"])
+    ]],
+    ["MMLU", "13b", "mmlu", [
+        ("Autoregressive", "LLaMA2-13B", "base", ["13b"]),
+        ("PipeSpec", "68M, 7B, 13B", "pipe", ["68m", "7b", "13b"])
+    ]]
 ]
 
-def get_active_gpus(metadata: Dict[str, Any]) -> Set[int]:
-    """Extract active GPU indices from metadata"""
-    active_gpus = set()
-    for config in metadata["model_configs"]:
-        for device in config["devices"]:
-            if device.startswith("cuda:"):
-                gpu_idx = int(device.split(":")[1])
-                active_gpus.add(gpu_idx)
-    return active_gpus
+def get_time_per_token(file_path):
+    data = json.load(open(file_path))
+    total_time = sum(s["metrics"]["total_time"] for s in data["results"])
+    total_tokens = sum(s["metrics"]["tokens_generated"] for s in data["results"])
+    return (total_time / total_tokens * 1000) if total_tokens else 0
 
-def find_matching_file(directory: Path, pattern: str) -> Path:
-    """Find a file matching the pattern in the directory"""
-    for file in directory.glob("*.json"):
-        if pattern in file.name:
-            return file
-    raise FileNotFoundError(f"No file matching pattern '{pattern}' found in {directory}")
-
-def analyze_single_file(file_path: str) -> Dict[str, float]:
-    """Analyze a single results file and return key metrics"""
-    with open(file_path, 'r') as f:
-        data = json.load(f)
-    
-    active_gpus = get_active_gpus(data["metadata"])
-    
-    # Initialize aggregation variables
-    total_time = 0
-    total_tokens = 0
-    gpu_utils = {gpu_idx: [] for gpu_idx in active_gpus}
-    gpu_powers = {gpu_idx: [] for gpu_idx in active_gpus}
-    
-    # Process each sample
-    for sample in data["results"]:
-        metrics = sample["metrics"]
-        total_time += metrics['total_time']
-        total_tokens += metrics['tokens_generated']
-        
-        # Process GPU stats
-        for stat in sample["gpustats"]:
-            for gpu_idx in active_gpus:
-                gpu_utils[gpu_idx].append(stat["gpu_utilizations"][gpu_idx])
-                gpu_powers[gpu_idx].append(stat["gpu_powers"][gpu_idx])
-    
-    # Calculate averages
-    avg_time_per_token = (total_time / total_tokens) * 1000 if total_tokens > 0 else 0
-    
-    # Calculate GPU averages
-    avg_util = mean([mean(utils) for utils in gpu_utils.values()])
-    avg_power = mean([mean(powers) for powers in gpu_powers.values()])
-    
-    # Calculate total energy and energy per token
-    total_energy = sum([mean(powers) * total_time for powers in gpu_powers.values()])
-    energy_per_token = total_energy / total_tokens if total_tokens > 0 else 0
-    
-    return {
-        "avg_time": avg_time_per_token,
-        "avg_util": avg_util,
-        "avg_power": avg_power,
-        "energy_per_token": energy_per_token
-    }
-
-def generate_results_table(results_dir: str):
-    """Generate results table from configured experiments"""
-    results_path = Path(results_dir)
-    
+def generate_tables(results_dir):
+    # Plain text table
     print("\nResults Table")
-    print("=" * 120)
-    print(f"{'Dataset':<15} {'Method':<15} {'Models':<20} {'Avg Time (ms)':<15} {'Speedup':<10} "
-          f"{'Avg Util (%)':<12} {'Avg Power (W)':<15} {'Energy/tok (J)'}")
-    print("-" * 120)
-    
-    for group in RESULT_GROUPS:
-        baseline_metrics = None
-        
-        for exp in group.experiments:
-            try:
-                file_path = find_matching_file(results_path / group.dataset_folder, exp["pattern"])
-                metrics = analyze_single_file(str(file_path))
-                
-                # If this is the baseline experiment, save its metrics
-                if exp["method"] == "Autoregressive":
-                    baseline_metrics = metrics
-                
-                # Calculate speedup relative to baseline
-                speedup = baseline_metrics["avg_time"] / metrics["avg_time"] if baseline_metrics else 1.0
-                
-                print(f"{group.dataset_name:<15} {exp['method']:<15} {exp['models']:<20} "
-                      f"{metrics['avg_time']:.2f}{'ms':<9} {speedup:.2f}{'×':<8} "
-                      f"{metrics['avg_util']:.1f}{'%':<9} {metrics['avg_power']:.1f}{'W':<11} "
-                      f"{metrics['energy_per_token']:.2f}")
-                
-            except FileNotFoundError as e:
-                print(f"Warning: {e}")
-                continue
-        
-        print("-" * 120)
+    print("=" * 80)
+    print(f"{'Dataset':<12} {'Method':<15} {'Models':<20} {'Time(ms)':<10} {'Speedup'}")
+    print("-" * 80)
 
-def main():
-    parser = argparse.ArgumentParser(description="Generate results table from benchmark results.")
-    parser.add_argument("directory", help="Path to the root directory containing benchmark results")
-    args = parser.parse_args()
+    latex = [
+        "\\begin{table}[t]",
+        "\\centering",
+        "\\caption{Performance and efficiency across decoding strategies.}",
+        "\\label{tab:results}",
+        "\\renewcommand{\\arraystretch}{1.1}",
+        "\\begin{threeparttable}",
+        "\\setlength{\\tabcolsep}{3pt}",
+        "\\begin{tabular}{c|l|l rr}",
+        "\\toprule",
+        "Dataset & Method & Models & \\makecell{Time\\\\(ms/tok)} & Speedup \\\\"
+    ]
+
+    # Calculate row counts for each dataset
+    dataset_rows = {}
+    current_dataset = None
     
-    generate_results_table(args.directory)
+    for dataset, _, _, experiments in EXPERIMENTS:
+        if dataset not in dataset_rows:
+            dataset_rows[dataset] = len(experiments)
+        else:
+            dataset_rows[dataset] += len(experiments)
+
+    prev_dataset = None
+    first_row_of_dataset = True
+    first_group = True
+    
+    for dataset, model, folder, experiments in EXPERIMENTS:
+        results = []
+        baseline_time = None
+
+        for exp in experiments:
+            method, display_models = exp[0], exp[1]
+            if method == "Speculative" or method == "PipeSpec":
+                display_models = "\\{" + display_models + "\\}"
+            speedup = exp[4] if len(exp) > 4 else None
+            citation = exp[5] if len(exp) > 5 else None
+            
+            if len(exp) == 4:  # Computed result
+                try:
+                    json_path = make_path(exp[2], exp[3])
+                    full_path = Path(results_dir) / folder / json_path
+                    time = get_time_per_token(full_path)
+                    if method == "Autoregressive":
+                        baseline_time = time
+                    speedup = baseline_time / time if baseline_time else 1.0
+                    results.append((method, display_models, time, speedup, citation))
+                except Exception as e:
+                    print(f"Warning: Could not process {full_path}: {e}")
+                    continue
+            else:  # Reference result
+                results.append((method, display_models, None, speedup, citation))
+
+        # Find best speedup first
+        best_speedup = max((r[3] for r in results if r[3] is not None), default=None)
+
+        # Add appropriate separator
+        if not first_group:
+            if dataset != prev_dataset:
+                latex.append("\\midrule[\\heavyrulewidth]")
+                first_row_of_dataset = True
+            else:
+                latex.append("\\cmidrule{2-5}")
+                first_row_of_dataset = False
+        else:
+            latex.append("\\midrule")
+            first_group = False
+
+        # Print results
+        for i, (method, models, time, speedup, citation) in enumerate(results):
+            # Plain text row
+            time_str = f"{time:.2f}" if time is not None else "-"
+            speedup_str = f"{speedup:.2f}" if speedup is not None else "-"
+            print(f"{dataset:<12} {method:<15} {models:<20} {time_str:<10} {speedup_str}x")
+
+            # LaTeX row formatting
+            time_str = f"{time:.2f}" if time is not None else "--"
+            speedup_str = f"{speedup:.2f}" if speedup is not None else "--"
+            
+            is_best = abs(speedup - best_speedup) < 0.01 if speedup and best_speedup else False
+            if is_best:
+                time_str = f"\\best{{{time_str}}}"
+                speedup_str = f"\\best{{{speedup_str}}}"
+
+            method_str = f"{method} (ours)" if method == "PipeSpec" else method
+            if citation:
+                method_str += f"\\cite{{{citation}}}"
+            
+            # Add dataset name only for first row of the entire dataset section
+            if first_row_of_dataset and i == 0:
+                dataset_str = f"\\multirow{{{dataset_rows[dataset]}}}{{*}}{{\\centering {dataset}}}"
+                first_row_of_dataset = False
+            else:
+                dataset_str = ""
+
+            # For non-first rows of a section, add leading space in place of dataset
+            prefix = " " if not dataset_str else ""
+            
+            row = f"{prefix}{dataset_str} & {method_str} & {models} & {time_str} & {speedup_str}$\\times$ \\\\"
+            latex.append(row)
+        
+        prev_dataset = dataset
+
+    latex.extend([
+        "\\bottomrule",
+        "\\end{tabular}",
+        "\\end{threeparttable}",
+        "\\end{table}"
+    ])
+
+    print("\nLaTeX Table:")
+    print("\n".join(latex))
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: python script.py <results_dir>")
+        sys.exit(1)
+    generate_tables(sys.argv[1])
